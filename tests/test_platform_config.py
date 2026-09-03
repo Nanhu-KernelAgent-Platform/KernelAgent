@@ -39,6 +39,11 @@ class TestGetPlatform:
         assert config.name == "xpu"
         assert config.device_string == "xpu"
 
+    def test_get_platform_musa(self):
+        config = get_platform("musa")
+        assert config.device_string == "musa"
+        assert config.torch_namespace == "musa"
+
     def test_get_platform_invalid_raises_valueerror(self):
         """get_platform() with invalid name should raise ValueError."""
         with pytest.raises(ValueError) as exc_info:
@@ -151,7 +156,7 @@ class TestPlatformRegistry:
         for name in get_platform_choices():
             config = get_platform(name)
             assert config.name == name
-            assert config.device_string in ["cuda", "xpu"]
+        assert config.device_string in ["cuda", "musa", "xpu"]
 
 
 class TestEdgeCases:
@@ -178,7 +183,7 @@ class TestEdgeCases:
             get_platform(" cuda ")
 
 
-@pytest.mark.parametrize("platform_name", ["cuda", "xpu"])
+@pytest.mark.parametrize("platform_name", ["cuda", "musa", "xpu"])
 def test_all_platforms_have_consistent_structure(platform_name):
     """All platforms should have consistent field types."""
     config = get_platform(platform_name)
@@ -189,7 +194,7 @@ def test_all_platforms_have_consistent_structure(platform_name):
     assert isinstance(config.cuda_hacks_to_strip, tuple)
 
 
-@pytest.mark.parametrize("platform_name", ["cuda", "xpu"])
+@pytest.mark.parametrize("platform_name", ["cuda", "musa", "xpu"])
 def test_platform_name_equals_device_string(platform_name):
     """Platform name should equal device string for simplicity."""
     config = get_platform(platform_name)

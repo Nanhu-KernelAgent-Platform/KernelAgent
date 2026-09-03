@@ -1,0 +1,8 @@
+Generate a native MUSA extension bundle.
+
+- Keep computation in kernel.mu; do not replace it with PyTorch eager operations.
+- kernel.py must expose kernel_function and load the extension built by setup.py.
+- setup.py must use torch_musa.utils.musa_extension.MUSAExtension and BuildExtension.
+- binding.cpp contains only the PyTorch binding and launch dispatch glue.
+- Keep all tensors and synchronization on torch.musa.
+- Return every required source file using the exact FILE block format.

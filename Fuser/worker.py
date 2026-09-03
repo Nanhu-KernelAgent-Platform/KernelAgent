@@ -115,6 +115,7 @@ class Worker:
                 error_context=state.last_error,
                 enable_reasoning_extras=self.cfg.enable_reasoning_extras,
                 model_name=self.cfg.model,
+                target_platform=self.cfg.target_platform,
             )
             prompt_path = self.dirs["prompts"] / f"iteration_{k}.txt"
             prompt_path.write_text(rp.user, encoding="utf-8")

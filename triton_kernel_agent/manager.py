@@ -23,6 +23,7 @@ from typing import Any
 from datetime import datetime
 import logging
 from contextlib import contextmanager
+from triton_kernel_agent.kernel_backend import KernelBundle
 
 
 class WorkerManager:
@@ -40,6 +41,7 @@ class WorkerManager:
         target_platform: str = "cuda",
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
+        kernel_backend: str = "triton",
     ):
         """
         Initialize the worker manager.
@@ -65,6 +67,7 @@ class WorkerManager:
         self.target_platform = target_platform
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
+        self.kernel_backend = kernel_backend
 
         # Setup logging
         if log_dir is None:
@@ -116,7 +119,7 @@ class WorkerManager:
 
     def run_verification(
         self,
-        kernel_seeds: list[str],
+        kernel_seeds: list[str | KernelBundle],
         test_code: list[str],
         problem_description: str,
         session_log_dir: Path | None = None,
@@ -172,6 +175,7 @@ class WorkerManager:
                     self.target_platform,
                     self.no_cusolver,
                     self.test_timeout_s,
+                    self.kernel_backend,
                 )
 
                 process = mp.Process(target=worker_process, args=args)
@@ -223,7 +227,7 @@ class WorkerManager:
 
 def worker_process(
     worker_id: int,
-    kernel_code: str,
+    kernel_code: str | KernelBundle,
     test_code: list[str],
     problem_description: str,
     workdir: Path,
@@ -238,6 +242,7 @@ def worker_process(
     target_platform: str,
     no_cusolver: bool = False,
     test_timeout_s: int = 30,
+    kernel_backend: str = "triton",
 ):
     """
     Worker process for kernel verification and refinement.
@@ -259,6 +264,7 @@ def worker_process(
         target_platform=target_platform,
         no_cusolver=no_cusolver,
         test_timeout_s=test_timeout_s,
+        kernel_backend=kernel_backend,
     )
 
     result = worker.run(

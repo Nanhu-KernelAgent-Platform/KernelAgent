@@ -104,11 +104,21 @@ def _extract_history_usage_from_response(
 
 def _write_kernel_file(
     kernel_file: Path, kernel_code: str, logger: Logger | None = None
-) -> None:
+) -> Path:
     """Write kernel code to file."""
-    kernel_file.write_text(kernel_code)
+    from triton_kernel_agent.kernel_backend import extract_kernel_bundle
+
+    bundle = extract_kernel_bundle(kernel_code)
+    if bundle is not None:
+        for name, content in bundle.files.items():
+            (kernel_file.parent / name).write_text(content, encoding="utf-8")
+        written_kernel = kernel_file.parent / "kernel.py"
+    else:
+        kernel_file.write_text(kernel_code, encoding="utf-8")
+        written_kernel = kernel_file
     if logger:
         logger.debug(f"Wrote kernel to {kernel_file}")
+    return written_kernel
 
 
 def _save_debug_file(

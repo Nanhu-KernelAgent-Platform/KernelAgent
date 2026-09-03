@@ -33,6 +33,7 @@ dependencies = [
     "gradio>=5.5.0",
     "requests",
     "numpy",
+    "pandas",
     "omegaconf",
 ]
 
@@ -61,7 +62,7 @@ include = ["triton_kernel_agent*", "kernel_perf_agent*", "Fuser*", "scripts", "u
 include-package-data = true
 
 [tool.setuptools.package-data]
-"triton_kernel_agent" = ["templates/*.j2"]
+"triton_kernel_agent" = ["templates/*.j2", "knowledge/musa/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

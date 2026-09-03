@@ -229,6 +229,7 @@ class OptimizationOrchestrator:
         prior_history: list[dict] | None = None,
         prior_reflexions: list[dict] | None = None,
         rag_prescriber: Any | None = None,
+        experience_context: str | None = None,
     ):
         """
         Initialize optimization orchestrator.
@@ -288,6 +289,7 @@ class OptimizationOrchestrator:
 
         # Optional RAG prescriber
         self.rag_prescriber = rag_prescriber
+        self.experience_context = experience_context or ""
 
         # Bottleneck selection for beam search diversity (1-indexed)
         self.bottleneck_id = bottleneck_id
@@ -349,6 +351,7 @@ class OptimizationOrchestrator:
         best_round_num: int = 0
         early_stop_reason = ""
         any_verified = False
+        self._profiling_unavailable = False
 
         # Cached baseline NCU — consumed at most once by _profile_and_analyze
         # when it runs on the identical baseline kernel (round 1 only).
@@ -444,7 +447,7 @@ class OptimizationOrchestrator:
             current_config = extract_triton_config(current_kernel)
 
             # RAG retrieval
-            rag_context = None
+            rag_context = self.experience_context or None
             if self.rag_prescriber is not None:
                 rag_query = f"{primary.category}: {primary.summary}"
                 if primary.recommended_fixes:
@@ -452,7 +455,12 @@ class OptimizationOrchestrator:
                 try:
                     opt_node, scores = self.rag_prescriber.retrieve(rag_query)
                     if opt_node is not None:
-                        rag_context = self.rag_prescriber.build_context(opt_node)
+                        static_context = self.rag_prescriber.build_context(opt_node)
+                        rag_context = (
+                            f"{rag_context}\n\n{static_context}"
+                            if rag_context
+                            else static_context
+                        )
                         self.logger.info(
                             f"[{round_num}] RAG retrieved pattern (len={len(rag_context)})"
                         )
@@ -512,8 +520,11 @@ class OptimizationOrchestrator:
             error_feedback = ""
 
             # Save and benchmark
-            kernel_file_round = self.artifact_dir / f"kernel_round_{round_num}.py"
-            kernel_file_round.write_text(optimized_kernel)
+            kernel_file_round = _write_kernel_file(
+                self.artifact_dir / f"kernel_round_{round_num}.py",
+                optimized_kernel,
+                self.logger,
+            )
 
             bench_results = self.benchmarker.benchmark_kernel(
                 kernel_file_round, problem_file
@@ -522,9 +533,16 @@ class OptimizationOrchestrator:
             new_ptx_hash = bench_results.get("ptx_hash")
 
             # Profile the NEW kernel to get its SOL metrics
-            new_kernel_metrics = self._profile_kernel_for_sol(
-                optimized_kernel, problem_file, round_num
-            )
+            if self._profiling_unavailable:
+                self.logger.warning(
+                    f"[{round_num}] Skipping candidate MCU profiling because "
+                    "baseline PFM collection failed"
+                )
+                new_kernel_metrics = None
+            else:
+                new_kernel_metrics = self._profile_kernel_for_sol(
+                    optimized_kernel, problem_file, round_num
+                )
             new_sol = (
                 new_kernel_metrics.get("efficiency_pct", 0.0)
                 if new_kernel_metrics
@@ -630,7 +648,11 @@ class OptimizationOrchestrator:
                         should_stop, stop_reason = self.roofline_analyzer.should_stop(
                             roofline_check
                         )
-                        if should_stop and self.roofline_analyzer.config.early_stop:
+                        # ``should_stop`` is the platform abstraction.  Do not
+                        # reach into an implementation-specific ``config``
+                        # attribute: lazy platform adapters intentionally only
+                        # expose the RooflineAnalyzerBase protocol.
+                        if should_stop:
                             self.logger.info(
                                 f"[{round_num}] 🎯 Early termination: {stop_reason}"
                             )
@@ -703,12 +725,14 @@ class OptimizationOrchestrator:
             baseline_results = {"time_ms": known_kernel_time, "speedup": 1.0}
             self.logger.info(f"📊 Using known kernel time: {best_time:.4f} ms")
             # Still need to profile for SOL
-            kernel_file_round = self.artifact_dir / "kernel_round_0.py"
-            kernel_file_round.write_text(kernel_code)
+            kernel_file_round = _write_kernel_file(
+                self.artifact_dir / "kernel_round_0.py", kernel_code, self.logger
+            )
         else:
             _write_kernel_file(self.kernel_file, kernel_code, self.logger)
-            kernel_file_round = self.artifact_dir / "kernel_round_0.py"
-            kernel_file_round.write_text(kernel_code)
+            kernel_file_round = _write_kernel_file(
+                self.artifact_dir / "kernel_round_0.py", kernel_code, self.logger
+            )
 
             baseline_results = self.benchmarker.benchmark_kernel(
                 kernel_file_round, problem_file
@@ -718,8 +742,14 @@ class OptimizationOrchestrator:
 
         # Profile baseline kernel for SOL metrics (skip if cached)
         if cached_baseline_metrics is not None:
-            baseline_metrics = cached_baseline_metrics
-            self.logger.info("📊 Baseline SOL: (using cached profile from manager)")
+            if cached_baseline_metrics.get("profile_failed"):
+                baseline_metrics = None
+                self.logger.warning(
+                    "📊 Baseline SOL unavailable: manager MCU PFM collection failed"
+                )
+            else:
+                baseline_metrics = cached_baseline_metrics
+                self.logger.info("📊 Baseline SOL: (using cached profile from manager)")
         else:
             baseline_metrics = self._profile_kernel_for_sol(
                 kernel_code, problem_file, 0
@@ -768,27 +798,53 @@ class OptimizationOrchestrator:
         # If the manager pre-profiled the baseline for us, consume it in round 1
         # (when current_kernel is still the baseline) and skip the NCU run.
         cached = self._pending_baseline_metrics
-        if cached is not None and round_num == 1 and cached.get("ncu_metrics"):
-            self.logger.info(
-                f"[{round_num}] Using cached baseline NCU profile (skipping NCU)"
-            )
-            # Still write the kernel file so downstream artifact paths are stable.
-            kernel_file_round = self.artifact_dir / f"kernel_round_{round_num - 1}.py"
-            kernel_file_round.write_text(current_kernel)
-            ncu_metrics = cached["ncu_metrics"]
-            self._pending_baseline_metrics = None  # consume once
+        if cached is not None and round_num == 1:
+            if cached.get("ncu_metrics"):
+                self.logger.info(
+                    f"[{round_num}] Using cached baseline NCU profile (skipping NCU)"
+                )
+                # Still write the kernel file so downstream artifact paths are stable.
+                kernel_file_round = _write_kernel_file(
+                    self.artifact_dir / f"kernel_round_{round_num - 1}.py",
+                    current_kernel,
+                    self.logger,
+                )
+                ncu_metrics = cached["ncu_metrics"]
+                self._pending_baseline_metrics = None  # consume once
+            elif cached.get("profile_failed"):
+                self.logger.warning(
+                    f"[{round_num}] Manager MCU profiling already failed; "
+                    "skipping duplicate profiling and using code/experience analysis"
+                )
+                self._pending_baseline_metrics = None
+                self._profiling_unavailable = True
+                bottleneck_results = self.bottleneck_analyzer.analyze(
+                    current_kernel, {}, round_num, None
+                )
+                return bottleneck_results or None, None, None
+            else:
+                ncu_metrics = {}
         else:
             self.logger.info(f"[{round_num}] Profiling current kernel with NCU...")
-            kernel_file_round = self.artifact_dir / f"kernel_round_{round_num - 1}.py"
-            kernel_file_round.write_text(current_kernel)
+            kernel_file_round = _write_kernel_file(
+                self.artifact_dir / f"kernel_round_{round_num - 1}.py",
+                current_kernel,
+                self.logger,
+            )
 
             profiler_results = self.profiler.profile_kernel(
                 kernel_file_round, problem_file, round_num
             )
 
             if profiler_results is None:
-                self.logger.warning(f"[{round_num}] Profiling failed")
-                return None, None, None
+                self.logger.warning(
+                    f"[{round_num}] Profiling failed; using code/experience analysis"
+                )
+                self._profiling_unavailable = True
+                bottleneck_results = self.bottleneck_analyzer.analyze(
+                    current_kernel, {}, round_num, None
+                )
+                return bottleneck_results or None, None, None
 
             ncu_metrics = profiler_results.metrics
 
@@ -871,8 +927,11 @@ class OptimizationOrchestrator:
         """
         try:
             # Write kernel to temp file for profiling
-            kernel_file = self.artifact_dir / f"kernel_round_{round_num}_sol.py"
-            kernel_file.write_text(kernel_code)
+            kernel_file = _write_kernel_file(
+                self.artifact_dir / f"kernel_round_{round_num}_sol.py",
+                kernel_code,
+                self.logger,
+            )
 
             profiler_results = self.profiler.profile_kernel(
                 kernel_file, problem_file, round_num
@@ -916,9 +975,15 @@ class OptimizationOrchestrator:
                 f.write(response_text)
 
             # Extract code
-            optimized_kernel = self.verification_worker._extract_code_from_response(
-                response_text,
-            )
+            if self.verification_worker._kernel_backend.name == "musa":
+                from triton_kernel_agent.kernel_backend import extract_kernel_bundle
+
+                bundle = extract_kernel_bundle(response_text)
+                optimized_kernel = bundle.render_for_prompt() if bundle else None
+            else:
+                optimized_kernel = self.verification_worker._extract_code_from_response(
+                    response_text,
+                )
 
             if not optimized_kernel or len(optimized_kernel) < 100:
                 self.logger.warning(
@@ -953,6 +1018,12 @@ class OptimizationOrchestrator:
                 problem_description=problem_description,
             )
         )
+
+        if success:
+            from triton_kernel_agent.kernel_backend import KernelBundle
+
+            if isinstance(final_kernel, KernelBundle):
+                final_kernel = final_kernel.render_for_prompt()
 
         if success:
             self.logger.info(f"[{round_num}] ✅ Correctness check passed")
@@ -1233,8 +1304,11 @@ class OptimizationOrchestrator:
         self.logger.info(f"   Improvement: {improvement_percent:.1f}%")
 
         # Save best runtime kernel (primary result)
-        best_kernel_file = self.output_dir / "best_kernel.py"
-        best_kernel_file.write_text(best_runtime_kernel)
+        best_kernel_file = _write_kernel_file(
+            self.output_dir / "best_kernel.py",
+            best_runtime_kernel,
+            self.logger,
+        )
 
         perf_metrics = {
             "baseline_time_ms": baseline_results["time_ms"],

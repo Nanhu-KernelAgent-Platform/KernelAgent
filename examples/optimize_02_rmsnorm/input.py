@@ -175,7 +175,7 @@ def _parse_kernel_args(x, args, kwargs):
 
 def kernel_function(x, *args, **kwargs):
     """
-    RMS Normalization over feature/channel dim (dim=1) for NCHW tensors on CUDA.
+    RMS Normalization over feature/channel dim (dim=1) for NCHW tensors on MUSA.
 
     Behavior:
     - Normalizes each (n, h, w) vector across channels c in [0, C), computing:
@@ -208,8 +208,8 @@ def kernel_function(x, *args, **kwargs):
     """
     if not isinstance(x, torch.Tensor):
         raise TypeError("x must be a torch.Tensor")
-    if x.device.type != "cuda":
-        raise ValueError("x must be on CUDA device")
+    if x.device.type != "musa":
+        raise ValueError("x must be on a MUSA device")
     if x.ndim != 4:
         raise ValueError(f"Expected 4D NCHW tensor, got shape {tuple(x.shape)}")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):

@@ -54,6 +54,11 @@ from triton_kernel_agent.platform_config import (
     get_platform_choices,
     PlatformConfig,
 )
+from triton_kernel_agent.kernel_backend import (
+    KernelBundle,
+    get_kernel_backend,
+    get_kernel_backend_choices,
+)
 
 
 def _shape_list(shape: Any) -> list[str]:
@@ -259,7 +264,9 @@ def _build_reference_code(item: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 def _synthesize_problem_description(
-    item: dict[str, Any], target_platform: PlatformConfig
+    item: dict[str, Any],
+    target_platform: PlatformConfig,
+    kernel_backend: str = "triton",
 ) -> str:
     id_ = str(item.get("id", "unknown"))
     type_ = str(item.get("type", ""))
@@ -274,10 +281,24 @@ def _synthesize_problem_description(
 
     ref_code, _ = _build_reference_code(item)
 
+    backend = get_kernel_backend(kernel_backend)
+    if backend.name == "musa":
+        generation_contract = """
+        - Return exactly four FILE blocks: kernel.py, binding.cpp, kernel.mu, and setup.py.
+        - kernel.py must expose kernel_function and load the extension built from setup.py.
+        - binding.cpp contains PyTorch binding and launch glue only; computation belongs in kernel.mu.
+        - setup.py must use torch_musa.utils.musa_extension.MUSAExtension and BuildExtension.
+        - Keep all compute tensors and synchronization on torch.musa.
+        """
+    else:
+        generation_contract = """
+        - Return a complete Python file with a @triton.jit kernel and a wrapper function named kernel_function(...).
+        """
+
     # Get device string for the platform
     header = textwrap.dedent(
         f"""
-        Implement a Triton kernel that computes the following subgraph end-to-end.
+        Implement a {backend.display_name} kernel that computes the following subgraph end-to-end.
 
         Subgraph ID: {id_}
         Type: {type_}
@@ -298,7 +319,8 @@ def _synthesize_problem_description(
         {json.dumps(item.get("ops", []), indent=2)}
 
         Requirements:
-        - Return a complete Python file with a @triton.jit kernel and a wrapper function named kernel_function(...).
+        Backend: {backend.name}
+        {textwrap.dedent(generation_contract).strip()}
         - kernel_function must accept input tensor(s) and any required weights/bias parameters (match shapes above).
         - Implement the exact semantics of the listed ops in the given order for the provided shapes.
         - Use {layout} layout and {dtype} dtype semantics.
@@ -335,6 +357,7 @@ def run(
     max_iters: int = 10,
     no_cusolver: bool = False,
     test_timeout_s: int = 30,
+    kernel_backend: str = "triton",
 ) -> Path:
     """Dispatch subgraphs to KernelAgent with optional parallelism.
 
@@ -354,13 +377,20 @@ def run(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     platform = get_platform(target_platform)
+    backend = get_kernel_backend(kernel_backend)
+    if not backend.supports_platform(platform.name):
+        raise ValueError(
+            f"Kernel backend {backend.name!r} does not support platform {platform.name!r}"
+        )
 
     # Worker function: create a dedicated agent instance per subgraph to avoid
     # cross-thread state interactions inside the agent/manager.
     def _handle_one(idx_item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
         idx, item = idx_item
         sid = str(item.get("id", f"subgraph_{idx}"))
-        pdesc = _synthesize_problem_description(item, target_platform=platform)
+        pdesc = _synthesize_problem_description(
+            item, target_platform=platform, kernel_backend=backend.name
+        )
         sg_dir = out_dir / sid
         sg_dir.mkdir(parents=True, exist_ok=True)
         (sg_dir / "problem.txt").write_text(pdesc, encoding="utf-8")
@@ -371,8 +401,9 @@ def run(
             max_rounds=max_iters,
             model_name=agent_model,
             target_platform=platform,
+            kernel_backend=backend.name,
             no_cusolver=no_cusolver,
-            test_timeout_s=test_timeout_s,
+            test_timeout_s=max(test_timeout_s, backend.verification_timeout_s),
         )
         try:
             result = local_agent.generate_kernel(
@@ -392,13 +423,38 @@ def run(
 
         if result.get("success"):
             kernel_code = result.get("kernel_code", "")
-            (sg_dir / "kernel.py").write_text(kernel_code, encoding="utf-8")
+            try:
+                files: dict[str, str]
+                if isinstance(kernel_code, KernelBundle):
+                    files = dict(kernel_code.files)
+                elif isinstance(kernel_code, dict):
+                    files = dict(kernel_code)
+                else:
+                    files = {"kernel.py": str(kernel_code)}
+                payload = KernelBundle(files)
+                payload.require(backend)
+                files = dict(payload.files)
+            except (AttributeError, TypeError, ValueError) as exc:
+                return idx, {
+                    "id": sid,
+                    "success": False,
+                    "message": f"invalid {backend.name} artifact: {exc}",
+                    "session_dir": result.get("session_dir"),
+                }
+            for name, content in files.items():
+                (sg_dir / name).write_text(content, encoding="utf-8")
             return idx, {
                 "id": sid,
                 "success": True,
                 "worker_id": result.get("worker_id"),
                 "rounds": result.get("rounds"),
                 "session_dir": result.get("session_dir"),
+                "kernel_backend": backend.name,
+                "target_platform": platform.name,
+                "artifact_dir": str(sg_dir.resolve()),
+                "files": {
+                    name: str((sg_dir / name).resolve()) for name in files
+                },
                 "kernel_path": str((sg_dir / "kernel.py").resolve()),
             }
         else:
@@ -436,7 +492,7 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     p = argparse.ArgumentParser(
-        description="Generate Triton kernels for subgraphs via KernelAgent"
+        description="Generate backend kernels for subgraphs via KernelAgent"
     )
     p.add_argument(
         "--subgraphs", required=True, help="Path to subgraphs.json produced by Fuser"
@@ -466,6 +522,12 @@ def main(argv: list[str] | None = None) -> int:
         default="cuda",
         choices=get_platform_choices(),
         help="Target platform (default: cuda)",
+    )
+    p.add_argument(
+        "--kernel-backend",
+        default="triton",
+        choices=get_kernel_backend_choices(),
+        help="Kernel source backend (default: triton)",
     )
     p.add_argument(
         "--no-cusolver",
@@ -500,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_model=args.agent_model,
         jobs=jobs_val,
         target_platform=args.target_platform,
+        kernel_backend=args.kernel_backend,
         no_cusolver=args.no_cusolver,
         test_timeout_s=args.test_timeout_s,
     )

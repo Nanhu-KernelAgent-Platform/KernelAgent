@@ -1,0 +1,36 @@
+Generate a correct, efficient native MUSA kernel for the following problem.
+
+## Problem
+{{ problem_description }}
+
+{{ structured_problem_context }}
+
+{{ knowledge_context }}
+
+## Tests
+{{ test_code }}
+
+{{ kernel_guidance }}
+{{ triton_guidelines }}
+
+Return exactly four fenced FILE blocks and no prose: kernel.py, binding.cpp,
+kernel.mu, and setup.py.
+
+Use these literal headers, in this order, without Markdown heading prefixes or
+backticks around filenames:
+FILE: kernel.py
+```python
+...
+```
+FILE: binding.cpp
+```cpp
+...
+```
+FILE: kernel.mu
+```cpp
+...
+```
+FILE: setup.py
+```python
+...
+```

@@ -225,6 +225,30 @@ def _register_builtins() -> None:
     for component, factory in _nvidia.items():
         registry.register(component, "nvidia", factory)
 
+    from triton_kernel_agent.platform.musa import (
+        MusaAcceleratorSpecsProvider,
+        MusaBenchmarker,
+        MusaBottleneckAnalyzer,
+        MusaKernelProfiler,
+        MusaWorkerRunner,
+        MusaVerifier,
+    )
+
+    _musa = {
+        "verifier": MusaVerifier,
+        "benchmarker": MusaBenchmarker,
+        "worker_runner": MusaWorkerRunner,
+        "specs_provider": MusaAcceleratorSpecsProvider,
+        "profiler": MusaKernelProfiler,
+        # These consume normalized SOL metrics and are hardware-neutral above
+        # the profiler boundary.
+        "roofline_analyzer": NvidiaRooflineAnalyzer,
+        "bottleneck_analyzer": MusaBottleneckAnalyzer,
+        "rag_prescriber": NvidiaRAGPrescriber,
+    }
+    for component, factory in _musa.items():
+        registry.register(component, "musa", factory)
+
     from triton_kernel_agent.platform.noop import (
         NoOpBenchmarker,
         NoOpBottleneckAnalyzer,

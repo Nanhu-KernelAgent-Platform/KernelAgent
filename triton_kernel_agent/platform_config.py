@@ -34,8 +34,12 @@ class PlatformConfig:
 
     name: str
     device_string: str
+    torch_namespace: str
     guidance_block: str
     kernel_guidance: str
+    profiler_name: str = "NCU"
+    profiler_command: str = "ncu"
+    profiler_file_prefix: str = "ncu"
     cuda_hacks_to_strip: tuple = field(default_factory=tuple)
 
 
@@ -65,6 +69,20 @@ You are generating a Triton kernel for Intel XPU (Xe GPUs). Follow these guideli
 4. **Optimal Block Sizes**: Start with 128-256 for most kernels
 5. **Data Types**: Intel supports fp32, fp16, bf16 (fp8 varies by generation)"""
 
+_MUSA_GUIDANCE = """\
+**CRITICAL PLATFORM REQUIREMENTS FOR MUSA:**
+- Allocate tensors on device='musa', never device='cuda'.
+- Use torch.musa for synchronization, events, and device properties.
+- Keep inputs, weights, intermediates, and outputs on the same MUSA device.
+- Do not monkey-patch torch.cuda or torch.device."""
+
+_MUSA_KERNEL_GUIDANCE = """\
+## MUSA-Specific Requirements
+
+Use torch.musa APIs and MUSA-compatible Triton or native MUSA source. Do not
+leave torch.cuda calls in wrappers or tests. Native MUSA kernels must use the
+project-managed MUSAExtension build scaffold."""
+
 _XPU_CUDA_HACKS = (
     "torch.cuda.is_available = lambda: True",
     "_orig_torch_device = torch.device",
@@ -76,18 +94,40 @@ _XPU_CUDA_HACKS = (
     "XPUDriver.is_available = classmethod(lambda cls: False)",
 )
 
+_MUSA_CUDA_HACKS = (
+    "torch.cuda.is_available = lambda: True",
+    "_orig_torch_device = torch.device",
+    "_real_torch_device = torch.device",
+    "def _fake_torch_device",
+    "torch.device = _fake_torch_device",
+    'os.environ["TRITON_BACKENDS"] = "cuda"',
+)
+
 # Platform registry
 PLATFORMS: dict[str, PlatformConfig] = {
     "cuda": PlatformConfig(
         name="cuda",
         device_string="cuda",
+        torch_namespace="cuda",
         guidance_block="",
         kernel_guidance="",
         cuda_hacks_to_strip=(),
     ),
+    "musa": PlatformConfig(
+        name="musa",
+        device_string="musa",
+        torch_namespace="musa",
+        guidance_block=_MUSA_GUIDANCE,
+        kernel_guidance=_MUSA_KERNEL_GUIDANCE,
+        profiler_name="MCU",
+        profiler_command="mcu",
+        profiler_file_prefix="mcu",
+        cuda_hacks_to_strip=_MUSA_CUDA_HACKS,
+    ),
     "xpu": PlatformConfig(
         name="xpu",
         device_string="xpu",
+        torch_namespace="xpu",
         guidance_block=_XPU_GUIDANCE,
         kernel_guidance=_XPU_KERNEL_GUIDANCE,
         cuda_hacks_to_strip=_XPU_CUDA_HACKS,

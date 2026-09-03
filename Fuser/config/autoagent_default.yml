@@ -6,6 +6,7 @@ ka_model: null           # null => pull from .env
 ka_num_workers: 4
 ka_max_rounds: 10
 ka_high_reasoning: true
+ka_log_dir: null         # null => use the repository's default log directory
 
 # Router LLM settings
 router_model: gpt-5
@@ -30,6 +31,7 @@ dispatch_jobs: 2
 # Routing behavior
 allow_fallback: true
 target_platform: cuda
+kernel_backend: triton
 ignore_router_config: false
 use_router_cache: true
 no_cusolver: false

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ from pathlib import Path
 import gradio as gr
 from dotenv import load_dotenv
 from triton_kernel_agent.platform_config import get_platform_choices
+from triton_kernel_agent.kernel_backend import get_kernel_backend_choices
 
 # Ensure project root is importable when run as a script.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -159,6 +161,7 @@ def run_pipeline_ui(
     router_high_reasoning: bool = True,
     user_api_key: str | None = None,
     target_platform: str = "cuda",
+    kernel_backend: str = "triton",
 ) -> PipelineArtifacts:
     from Fuser.auto_agent import AutoKernelRouter
     from Fuser.pipeline import run_pipeline
@@ -230,6 +233,7 @@ def run_pipeline_ui(
                 dispatch_jobs=(dispatch_jobs if dispatch_jobs else "1"),
                 allow_fallback=True,
                 target_platform=target_platform,
+                kernel_backend=kernel_backend,
             )
             rr = router.solve(problem_file)
             elapsed = time.time() - start_time
@@ -252,7 +256,13 @@ def run_pipeline_ui(
                         if k in det and det[k] is not None:
                             details_lines.append(f"- {k}: `{det[k]}`")
                 details_md = "\n".join(details_lines)
-                code_text = rr.kernel_code or ""
+                code_text = (
+                    rr.kernel_code
+                    if isinstance(rr.kernel_code, str)
+                    else json.dumps(rr.kernel_code, indent=2, default=str)
+                    if rr.kernel_code is not None
+                    else ""
+                )
                 run_info_md = "## 📁 Run Information\n- Route: KernelAgent"
                 return PipelineArtifacts(
                     status_md=status,
@@ -331,6 +341,7 @@ def run_pipeline_ui(
             verify=verify,
             compose_max_iters=compose_max_iters,
             target_platform=target_platform,
+            kernel_backend=kernel_backend,
         )
         elapsed = time.time() - start_time
         run_dir = Path(res.get("run_dir", ".")).resolve()
@@ -454,6 +465,7 @@ class PipelineUI:
         verify: bool,
         user_api_key: str | None,
         target_platform: str = "cuda",
+        kernel_backend: str = "triton",
     ) -> tuple[str, str, str, str, str | None]:
         problem_mapping = {label: path for label, path in self.problem_choices}
         selected_path = problem_mapping.get(selected_problem_label, "")
@@ -477,6 +489,7 @@ class PipelineUI:
             router_high_reasoning=router_high_reasoning,
             user_api_key=user_api_key,
             target_platform=target_platform,
+            kernel_backend=kernel_backend,
         )
         return (
             arts.status_md,
@@ -623,7 +636,13 @@ Run the extract → dispatch → compose pipeline on KernelBench problems and do
                     choices=get_platform_choices(),
                     label="Target Platform",
                     value="cuda",
-                    info="CUDA for NVIDIA GPUs, XPU for Intel GPUs",
+                    info="CUDA for NVIDIA GPUs, MUSA for Moore Threads, XPU for Intel GPUs",
+                )
+                backend_dropdown = gr.Dropdown(
+                    choices=get_kernel_backend_choices(),
+                    label="Kernel Backend",
+                    value="triton",
+                    info="Triton is the default; native MUSA requires target platform MUSA.",
                 )
 
                 run_button = gr.Button("🚀 Run Pipeline", variant="primary")
@@ -655,6 +674,7 @@ Run the extract → dispatch → compose pipeline on KernelBench problems and do
             compose_max_iters: int,
             verify: bool,
             platform: str,
+            backend: str,
             api_key: str | None,
         ):
             return ui.run(
@@ -675,6 +695,7 @@ Run the extract → dispatch → compose pipeline on KernelBench problems and do
                 verify=verify,
                 user_api_key=api_key,
                 target_platform=platform,
+                kernel_backend=backend,
             )
 
         run_button.click(
@@ -696,6 +717,7 @@ Run the extract → dispatch → compose pipeline on KernelBench problems and do
                 compose_iters_slider,
                 verify_checkbox,
                 platform_dropdown,
+                backend_dropdown,
                 api_key_input,
             ],
             outputs=[status_out, details_out, code_out, run_info_out, download_out],

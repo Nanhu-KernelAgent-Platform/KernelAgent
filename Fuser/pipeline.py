@@ -40,7 +40,11 @@ from pathlib import Path
 from .subgraph_extractor import extract_subgraphs_to_json
 from .dispatch_kernel_agent import run as dispatch_run
 from .compose_end_to_end import compose
-from triton_kernel_agent.platform_config import get_platform_choices
+from triton_kernel_agent.platform_config import get_platform_choices, get_platform
+from triton_kernel_agent.kernel_backend import (
+    get_kernel_backend,
+    get_kernel_backend_choices,
+)
 
 
 def run_pipeline(
@@ -58,7 +62,14 @@ def run_pipeline(
     compose_max_iters: int = 5,
     target_platform: str = "cuda",
     test_timeout_s: int = 30,
+    kernel_backend: str = "triton",
 ) -> dict:
+    platform = get_platform(target_platform)
+    backend = get_kernel_backend(kernel_backend)
+    if not backend.supports_platform(platform.name):
+        raise ValueError(
+            f"Kernel backend {backend.name!r} does not support platform {platform.name!r}"
+        )
     # Select default KernelAgent model if not provided: prefer GPT-5 for Level 2/3
     if dispatch_model is None:
         pp = str(problem_path)
@@ -112,6 +123,7 @@ def run_pipeline(
         agent_model=dispatch_model,
         jobs=jobs_val,
         target_platform=target_platform,
+        kernel_backend=kernel_backend,
         max_iters=max_iters,
         test_timeout_s=test_timeout_s,
     )
@@ -128,6 +140,7 @@ def run_pipeline(
         verify=verify,
         max_iters=compose_max_iters,
         target_platform=target_platform,
+        kernel_backend=kernel_backend,
     )
     return {
         "run_dir": str(run_dir),
@@ -175,6 +188,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=get_platform_choices(),
         help="Target platform",
     )
+    p.add_argument(
+        "--kernel-backend",
+        default="triton",
+        choices=get_kernel_backend_choices(),
+        help="Kernel source backend (default: triton)",
+    )
     p.add_argument("--test-timeout-s", type=int, default=30)
     args = p.parse_args(argv)
 
@@ -198,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             verify=args.verify,
             compose_max_iters=args.compose_max_iters,
             target_platform=args.target_platform,
+            kernel_backend=args.kernel_backend,
             test_timeout_s=args.run_timeout_s,
         )
         print(json.dumps(res, indent=2))

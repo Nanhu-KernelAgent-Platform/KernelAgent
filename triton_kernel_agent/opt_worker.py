@@ -84,6 +84,7 @@ class OptimizationWorker:
         divergence_threshold: float = 50.0,
         sol_improvement_threshold: float = 5.0,
         target_platform: str = "cuda",
+        kernel_backend: str = "triton",
         roofline_config: RooflineConfig | None = None,
         # BeamSearch parameters (passed by opt_manager)
         bottleneck_id: int | None = None,
@@ -104,6 +105,7 @@ class OptimizationWorker:
         platform_config: dict[str, str] | None = None,
         # Template overrides from YAML config ─────────────────────
         templates: dict[str, str] | None = None,
+        experience_context: str | None = None,
     ):
         """
         Initialize the optimization worker.
@@ -145,6 +147,7 @@ class OptimizationWorker:
         self.divergence_threshold = divergence_threshold
         self.sol_improvement_threshold = sol_improvement_threshold
         self.target_platform = target_platform
+        self.kernel_backend = kernel_backend
         self.gpu_name = gpu_name
         self.ncu_bin_path = ncu_bin_path
         self.benchmark_warmup = benchmark_warmup
@@ -158,6 +161,7 @@ class OptimizationWorker:
 
         # Template overrides (forwarded to PromptManager)
         self.templates_config = templates
+        self.experience_context = experience_context
 
         # BeamSearch parameters
         self.bottleneck_id = bottleneck_id
@@ -269,22 +273,35 @@ class OptimizationWorker:
         platform_config = get_platform(self.target_platform)
         self.prompt_manager = PromptManager(
             target_platform=platform_config,
+            kernel_backend=self.kernel_backend,
             template_overrides=self.templates_config,
         )
 
-        # Benchmarking
-        from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
-            Benchmark,
-        )
+        # Benchmarking. Native MUSA bundles need extension build/materialization
+        # rather than the single-file Triton subprocess benchmark.
+        if self.target_platform == "musa" and self.kernel_backend == "musa":
+            from triton_kernel_agent.platform.musa import MusaBenchmarker
 
-        self.benchmarker = Benchmark(
-            logger=self.logger,
-            artifacts_dir=self.artifact_dir,
-            benchmark_lock=self.benchmark_lock,
-            worker_id=self.worker_id,
-            warmup=self.benchmark_warmup,
-            repeat=self.benchmark_repeat,
-        )
+            self.benchmarker = MusaBenchmarker(
+                logger=self.logger,
+                log_dir=self.log_dir,
+                benchmark_lock=self.benchmark_lock,
+                warmup=self.benchmark_warmup,
+                repeat=self.benchmark_repeat,
+            )
+        else:
+            from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+                Benchmark,
+            )
+
+            self.benchmarker = Benchmark(
+                logger=self.logger,
+                artifacts_dir=self.artifact_dir,
+                benchmark_lock=self.benchmark_lock,
+                worker_id=self.worker_id,
+                warmup=self.benchmark_warmup,
+                repeat=self.benchmark_repeat,
+            )
 
         # Profiler
         if "profiler" in self._platform:
@@ -329,6 +346,7 @@ class OptimizationWorker:
             openai_model=self.openai_model,
             high_reasoning_effort=self.high_reasoning_effort,
             target_platform=self.target_platform,
+            kernel_backend=self.kernel_backend,
         )
 
         # Roofline analyzer
@@ -425,6 +443,7 @@ class OptimizationWorker:
             bottleneck_id=self.bottleneck_id,
             bottleneck_override=self.bottleneck_override,
             rag_prescriber=self.rag_prescriber,
+            experience_context=self.experience_context,
             # Shared history from beam search manager
             prior_history=self.prior_history,
             prior_reflexions=self.prior_reflexions,

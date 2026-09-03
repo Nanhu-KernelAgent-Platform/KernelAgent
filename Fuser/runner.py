@@ -24,6 +24,9 @@ import random
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
+
+from triton_kernel_agent.kernel_backend import KernelBundle
 
 from Fuser.runner_util import _run_candidate_multiprocess
 
@@ -75,6 +78,17 @@ def _allowlist_env() -> dict[str, str]:
     allow: dict[str, str] = {}
     for k, v in os.environ.items():
         if k == "PATH":
+            allow[k] = v
+        elif k in {
+            "HOME",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            "LD_LIBRARY_PATH",
+            "LIBRARY_PATH",
+            "CPATH",
+        } or k.startswith(("MUSA_", "CUDA_", "TORCH_", "TRITON_")):
+            # Native extension builds need compiler/toolkit discovery variables.
             allow[k] = v
         elif k == "PYTHONPATH":
             # sanitize: keep only absolute, existing dirs
@@ -301,6 +315,90 @@ def run_candidate(
         passed = False
         reason = f"nonzero exit code: {rc}"
 
+    return RunResult(
+        rc=rc,
+        passed=passed,
+        validator_used=validator,
+        reason=reason,
+        t_started=t_started,
+        t_finished=t_finished,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+
+
+def run_bundle_candidate(
+    bundle: KernelBundle | Mapping[str, str],
+    run_root: Path,
+    timeout_s: int,
+    isolated: bool,
+    deny_network: bool,
+    entrypoint: str = "kernel.py",
+    cancel_event: "threading.Event" | None = None,
+) -> RunResult:
+    """Execute a validated multi-file kernel bundle in an isolated directory."""
+    payload = bundle if isinstance(bundle, KernelBundle) else KernelBundle(bundle)
+    if entrypoint not in payload.files:
+        raise ValueError(f"Bundle is missing entrypoint {entrypoint!r}")
+    run_dir = (
+        run_root
+        / f"attempt_{int(time.time() * 1000)}_{os.getpid()}_{random.randint(0, 9999):04d}"
+    )
+    run_dir.mkdir(parents=True, exist_ok=False)
+    for name, content in payload.files.items():
+        path = run_dir / name
+        path.write_text(content, encoding="utf-8")
+
+    exec_filename = entrypoint
+    if deny_network:
+        _write_sitecustomize_block_network(run_dir)
+    stdout_path = run_dir / "stdout.txt"
+    stderr_path = run_dir / "stderr.txt"
+    argv = [sys.executable, "-u"]
+    if isolated and not deny_network:
+        argv.append("-I")
+    argv.append(exec_filename)
+    env = _allowlist_env()
+    t_started = time.time()
+    (run_dir / "EXEC_STARTED").write_text(str(t_started), encoding="utf-8")
+    rc, t_finished = (
+        _run_candidate(
+            run_dir,
+            argv,
+            env,
+            stdout_path,
+            stderr_path,
+            t_started,
+            timeout_s,
+            cancel_event,
+        )
+        if os.getenv("FUSER_COMPOSE_USE_SYS_EXECUTABLE", "1") == "1"
+        else _run_candidate_multiprocess(
+            exec_filename,
+            run_dir,
+            argv,
+            env,
+            stdout_path,
+            stderr_path,
+            t_started,
+            timeout_s,
+            cancel_event,
+        )
+    )
+    out_text, scan_truncated = _read_all_text_bounded(stdout_path, MAX_SCAN_BYTES)
+    if rc == 0 and _PASS_REGEX.search(out_text):
+        passed, validator, reason = True, "run_tests", "run_tests printed PASS and exited 0"
+    elif rc == 0 and _SENTINEL in out_text:
+        passed, validator, reason = True, "sentinel", "sentinel ALL_TESTS_PASSED found and exited 0"
+    elif rc == 0:
+        passed, validator = False, "unknown"
+        reason = (
+            "rc==0 but neither PASS nor sentinel found (scan_truncated=true)"
+            if scan_truncated
+            else "rc==0 but neither PASS nor sentinel found"
+        )
+    else:
+        passed, validator, reason = False, "unknown", f"nonzero exit code: {rc}"
     return RunResult(
         rc=rc,
         passed=passed,

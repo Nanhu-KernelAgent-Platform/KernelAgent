@@ -28,6 +28,11 @@ from pathlib import Path
 from typing import Any
 
 from triton_kernel_agent.platform_config import get_platform
+from triton_kernel_agent.kernel_backend import (
+    KernelBundle,
+    extract_kernel_bundle,
+    get_kernel_backend,
+)
 from triton_kernel_agent.worker_util import format_test_code_for_llm
 from utils.providers import get_model_provider
 
@@ -137,6 +142,7 @@ class VerificationWorker:
         target_platform: str = "cuda",
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
+        kernel_backend: str = "triton",
     ):
         """
         Initialize a verification worker.
@@ -164,6 +170,7 @@ class VerificationWorker:
         self._platform_config = get_platform(target_platform)
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
+        self._kernel_backend = get_kernel_backend(kernel_backend)
 
         # Setup files
         self.kernel_file = self.workdir / "kernel.py"
@@ -176,7 +183,10 @@ class VerificationWorker:
         self._setup_logging()
 
         # Initialize prompt manager with resolved config
-        self.prompt_manager = PromptManager(target_platform=self._platform_config)
+        self.prompt_manager = PromptManager(
+            target_platform=self._platform_config,
+            kernel_backend=self._kernel_backend,
+        )
 
         # Initialize provider (may be unavailable in offline/test environments)
         self.provider = None
@@ -262,8 +272,21 @@ class VerificationWorker:
         self.logger.warning("No code block found in LLM response")
         return None
 
-    def _validate_kernel_candidate(self, kernel_code: str | None) -> str | None:
+    def _validate_kernel_candidate(
+        self, kernel_code: str | KernelBundle | None
+    ) -> str | None:
         """Return a reason when extracted kernel code is structurally malformed."""
+        if isinstance(kernel_code, str) and self._kernel_backend.name == "musa":
+            kernel_code = extract_kernel_bundle(kernel_code)
+        if isinstance(kernel_code, KernelBundle):
+            try:
+                kernel_code.require(self._kernel_backend)
+            except ValueError as exc:
+                return str(exc)
+            wrapper = kernel_code.files.get("kernel.py", "")
+            if "def kernel_function" not in wrapper:
+                return "kernel.py is missing required kernel_function definition"
+            return None
         if not kernel_code or not kernel_code.strip():
             return "no Python kernel code was extracted from the model response"
 
@@ -283,12 +306,20 @@ class VerificationWorker:
 
         return None
 
-    def _write_kernel(self, kernel_code: str):
+    def _write_kernel(self, kernel_code: str | KernelBundle):
         """Write only the kernel code to file."""
-        self.kernel_file.write_text(kernel_code)
+        if isinstance(kernel_code, str) and self._kernel_backend.name == "musa":
+            parsed = extract_kernel_bundle(kernel_code)
+            if parsed is not None:
+                kernel_code = parsed
+        if isinstance(kernel_code, KernelBundle):
+            for name, content in kernel_code.files.items():
+                (self.workdir / name).write_text(content, encoding="utf-8")
+        else:
+            self.kernel_file.write_text(kernel_code, encoding="utf-8")
         self.logger.info("Updated kernel file")
 
-    def _write_files(self, kernel_code: str, test_code: list[str]):
+    def _write_files(self, kernel_code: str | KernelBundle, test_code: list[str]):
         """Write kernel and test code to files.
 
         Note: The test code should import the kernel function from the kernel file:
@@ -302,7 +333,7 @@ class VerificationWorker:
                 primary test written to ``test_kernel.py``; any subsequent
                 entries are written to ``test_extra_{i}_kernel.py``.
         """
-        self.kernel_file.write_text(kernel_code)
+        self._write_kernel(kernel_code)
         self.test_files = []
         for i, code in enumerate(test_code):
             name = "test_kernel.py" if i == 0 else f"test_extra_{i}_kernel.py"
@@ -316,10 +347,25 @@ class VerificationWorker:
         pattern = re.compile(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|#.*)')
         return re.sub(pattern, "", code)
 
-    def _detect_pytorch_compute(self, kernel_code: str) -> str | None:
+    def _detect_pytorch_compute(self, kernel_code: str | KernelBundle) -> str | None:
         """Detect disallowed PyTorch usage inside the kernel wrapper."""
-        sanitized = self._strip_comments_and_strings(kernel_code)
+        if isinstance(kernel_code, str) and self._kernel_backend.name == "musa":
+            parsed = extract_kernel_bundle(kernel_code)
+            if parsed is not None:
+                kernel_code = parsed
+        source = (
+            kernel_code.files.get("kernel.py", "")
+            if isinstance(kernel_code, KernelBundle)
+            else kernel_code
+        )
+        sanitized = self._strip_comments_and_strings(source)
         for pattern, message in DISALLOWED_TORCH_PATTERNS:
+            # Native MUSA's Python wrapper legitimately calls the compiled
+            # extension entry point (commonly ``extension.forward(...)``).
+            # The remaining torch.nn and tensor-compute bans still prevent a
+            # PyTorch fallback from bypassing native kernel execution.
+            if self._kernel_backend.name == "musa" and pattern.pattern == r"\.forward\(":
+                continue
             if pattern.search(sanitized):
                 return message
         return None
@@ -332,6 +378,23 @@ class VerificationWorker:
             Tuple of (success, stdout, stderr)
         """
         try:
+            if self._kernel_backend.name == "musa":
+                build = subprocess.run(
+                    [sys.executable, "setup.py", "build_ext", "--inplace"],
+                    cwd=str(self.workdir),
+                    capture_output=True,
+                    text=True,
+                    timeout=self.test_timeout_s,
+                )
+                if build.returncode != 0:
+                    self.logger.error(
+                        "Native MUSA extension build failed. Exit code: %s, stderr: %s",
+                        build.returncode,
+                        build.stderr[-4000:],
+                    )
+                    return False, build.stdout, build.stderr
+                self.logger.info("Native MUSA extension build passed")
+
             for test_file in self.test_files:
                 if not test_file.exists():
                     continue
@@ -388,11 +451,11 @@ class VerificationWorker:
 
     def _refine_kernel(
         self,
-        kernel_code: str,
+        kernel_code: str | KernelBundle,
         error_info: dict[str, str],
         problem_description: str,
         test_code: str,
-    ) -> str:
+    ) -> str | KernelBundle:
         """
         Refine kernel based on error information using OpenAI API.
 
@@ -408,7 +471,13 @@ class VerificationWorker:
                     history_context = "\n\nPREVIOUS ATTEMPTS:\n"
                     for i, round_data in enumerate(self.history):
                         history_context += f"\nAttempt {i + 1}:\n"
-                        history_context += f"Kernel code:\n```python\n{round_data['kernel_code'][:500]}...\n```\n"
+                        prior = round_data["kernel_code"]
+                        prior_text = (
+                            KernelBundle(prior).render_for_prompt()
+                            if isinstance(prior, dict)
+                            else prior
+                        )
+                        history_context += f"Kernel code:\n{prior_text[:500]}...\n"
                         if round_data.get("stderr"):
                             history_context += f"Error: {round_data['stderr'][:2000]}\n"
                         if round_data.get("stdout"):
@@ -420,7 +489,11 @@ class VerificationWorker:
                 prompt = self.prompt_manager.render_kernel_refinement_prompt(
                     problem_description=problem_description,
                     test_code=test_code,
-                    kernel_code=kernel_code,
+                    kernel_code=(
+                        kernel_code.render_for_prompt()
+                        if isinstance(kernel_code, KernelBundle)
+                        else kernel_code
+                    ),
                     error_info=error_info,
                     history_context=history_context,
                     no_cusolver=self.no_cusolver,
@@ -431,9 +504,15 @@ class VerificationWorker:
                 response_text = self._call_llm(messages, max_tokens=20000)
 
                 # Extract refined kernel from response
-                refined_kernel = self._extract_code_from_response(
-                    response_text,
-                    prefer_kernel_function=getattr(self, "_has_multiple_tests", False),
+                refined_kernel = (
+                    extract_kernel_bundle(response_text)
+                    if self._kernel_backend.name == "musa"
+                    else self._extract_code_from_response(
+                        response_text,
+                        prefer_kernel_function=getattr(
+                            self, "_has_multiple_tests", False
+                        ),
+                    )
                 )
                 malformed_reason = self._validate_kernel_candidate(refined_kernel)
 
@@ -464,19 +543,29 @@ class VerificationWorker:
         # For testing, make a simple modification
         if "error" in error_info.get("stderr", "").lower():
             # Add a comment to show refinement happened
-            return f"# Refinement attempt {len(self.history) + 1}\n{kernel_code}"
+            if isinstance(kernel_code, str):
+                return f"# Refinement attempt {len(self.history) + 1}\n{kernel_code}"
 
         return kernel_code
 
     def _log_round(
-        self, round_num: int, success: bool, kernel_code: str, stdout: str, stderr: str
+        self,
+        round_num: int,
+        success: bool,
+        kernel_code: str | KernelBundle,
+        stdout: str,
+        stderr: str,
     ):
         """Log the results of a verification round."""
         round_data = {
             "round": round_num,
             "timestamp": datetime.now().isoformat(),
             "success": success,
-            "kernel_code": kernel_code,
+            "kernel_code": (
+                dict(kernel_code.files)
+                if isinstance(kernel_code, KernelBundle)
+                else kernel_code
+            ),
             "stdout": stdout,
             "stderr": stderr,
         }
@@ -491,7 +580,7 @@ class VerificationWorker:
 
     def run(
         self,
-        kernel_code: str,
+        kernel_code: str | KernelBundle,
         test_code: list[str],
         problem_description: str,
         success_event: mp.Event,
@@ -601,7 +690,11 @@ class VerificationWorker:
                 return {
                     "worker_id": self.worker_id,
                     "success": True,
-                    "kernel_code": current_kernel,
+                    "kernel_code": (
+                        dict(current_kernel.files)
+                        if isinstance(current_kernel, KernelBundle)
+                        else current_kernel
+                    ),
                     "rounds": round_num + 1,
                     "history": list(self.history),
                 }
@@ -655,7 +748,7 @@ class VerificationWorker:
         }
 
     def _single_verification_pass(
-        self, kernel_code: str
+        self, kernel_code: str | KernelBundle
     ) -> tuple[bool, str, str, str | None]:
         """
         Run a single verification pass on the kernel.
@@ -684,11 +777,11 @@ class VerificationWorker:
 
     def verify_with_refinement(
         self,
-        kernel_code: str,
+        kernel_code: str | KernelBundle,
         test_code: list[str],
         problem_description: str,
         max_refine_attempts: int = 3,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str | KernelBundle, str]:
         """
         Verify kernel correctness with refinement attempts.
 

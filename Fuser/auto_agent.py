@@ -62,6 +62,10 @@ from triton_kernel_agent.platform_config import (
     get_platform_choices,
     get_platform,
 )
+from triton_kernel_agent.kernel_backend import (
+    get_kernel_backend,
+    get_kernel_backend_choices,
+)
 from utils.providers.models import get_model_provider, is_model_available
 
 
@@ -318,7 +322,7 @@ class RouteResult:
     route: str  # "kernelagent" or "fuser"
     success: bool
     details: dict[str, Any]
-    kernel_code: str | None = None
+    kernel_code: Any = None
 
 
 @config_injectable
@@ -351,6 +355,8 @@ class AutoKernelRouter:
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
         test_code: str | None = None,
+        kernel_backend: str = "triton",
+        ka_log_dir: str | None = None,
     ) -> None:
         self.ka_model = ka_model
         self.ka_num_workers = ka_num_workers
@@ -373,21 +379,30 @@ class AutoKernelRouter:
         self.dispatch_jobs = dispatch_jobs
         self.allow_fallback = allow_fallback
         self.platform_config = get_platform(target_platform)
+        self.kernel_backend_config = get_kernel_backend(kernel_backend)
+        if not self.kernel_backend_config.supports_platform(self.platform_config.name):
+            raise ValueError(
+                f"Kernel backend {self.kernel_backend_config.name!r} does not support "
+                f"platform {self.platform_config.name!r}"
+            )
         self.ignore_router_config = ignore_router_config
         self.use_router_cache = use_router_cache
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
         self.test_code = test_code
+        self.ka_log_dir = ka_log_dir
 
     def _solve_with_kernelagent(
         self, problem_code: str, test_code: str | None = None
     ) -> RouteResult:
         agent = TritonKernelAgent(
+            log_dir=self.ka_log_dir,
             num_workers=self.ka_num_workers,
             max_rounds=self.ka_max_rounds,
             model_name=self.ka_model,
             high_reasoning_effort=self.ka_high_reasoning,
             target_platform=self.platform_config,
+            kernel_backend=self.kernel_backend_config.name,
             no_cusolver=self.no_cusolver,
             test_timeout_s=self.run_timeout_s,
         )
@@ -454,6 +469,7 @@ class AutoKernelRouter:
                 verify=self.verify,
                 compose_max_iters=self.compose_max_iters,
                 target_platform=self.platform_config.name,
+                kernel_backend=self.kernel_backend_config.name,
                 test_timeout_s=self.test_timeout_s,
             )
         except BaseException as exc:  # catch SystemExit and others
@@ -470,7 +486,7 @@ class AutoKernelRouter:
 
         comp = res.get("composition", {}) or {}
         ok = bool(comp.get("verify_passed", not self.verify))
-        kernel_code: str | None = None
+        kernel_code: Any = None
         try:
             composed_path = comp.get("composed_path")
             if composed_path and Path(composed_path).is_file():
@@ -771,6 +787,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Target platform (default: cuda)",
     )
     p.add_argument(
+        "--kernel-backend",
+        default="triton",
+        choices=get_kernel_backend_choices(),
+        help="Kernel source backend (default: triton)",
+    )
+    p.add_argument(
         "--no-cusolver",
         action="store_true",
         help="Disable cuSolver library usage in generated kernels",
@@ -822,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_jobs=args.dispatch_jobs,
             allow_fallback=(not args.no_fallback),
             target_platform=args.target_platform,
+            kernel_backend=args.kernel_backend,
             ignore_router_config=args.ignore_router_config,
             use_router_cache=(not args.no_router_cache),
             no_cusolver=args.no_cusolver,

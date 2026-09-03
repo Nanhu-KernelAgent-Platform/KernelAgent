@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Compose an end-to-end Triton kernel for the original KernelBench problem by
+Compose an end-to-end backend kernel for the original KernelBench problem by
 leveraging:
   1) Fuser's subgraphs JSON (decomposition + shapes)
-  2) KernelAgent-generated Triton kernels for those subgraphs
+  2) KernelAgent-generated backend kernels for those subgraphs
 
 We call an LLM to synthesize a final composed kernel that matches the original
 problem semantics, returning one complete Python file that exposes
-`kernel_function(...)` and includes a minimal self-test that checks numerical
-equivalence against a PyTorch reference derived from the original problem.
+`kernel_function(...)`. Triton uses a single Python file; native MUSA uses a
+validated four-file extension bundle and a self-test.
 
 Usage:
   python -m Fuser.compose_end_to_end \
@@ -54,6 +54,13 @@ from triton_kernel_agent.platform_config import (
     get_platform_choices,
     PlatformConfig,
 )
+from triton_kernel_agent.kernel_backend import (
+    KernelBundle,
+    get_kernel_backend,
+    get_kernel_backend_choices,
+    KernelBackendConfig,
+    extract_kernel_bundle,
+)
 
 # Reuse KernelAgent provider stack for LLM calls
 try:
@@ -65,7 +72,7 @@ except Exception:
 from .code_extractor import extract_single_python_file
 
 # Reuse Fuser runner for optional verification
-from .runner import run_candidate
+from .runner import run_candidate, run_bundle_candidate
 
 
 @dataclass
@@ -73,13 +80,17 @@ class KernelItem:
     subgraph_id: str
     kernel_path: Path
     code: str
+    files: dict[str, str]
+    kernel_backend: str = "triton"
 
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _load_kernels_from_summary(summary_path: Path) -> list[KernelItem]:
+def _load_kernels_from_summary(
+    summary_path: Path, expected_backend: str = "triton"
+) -> list[KernelItem]:
     data = json.loads(_read_text(summary_path))
     if not isinstance(data, list):
         raise SystemExit("kernels summary must be a JSON array (from dispatch step)")
@@ -92,6 +103,12 @@ def _load_kernels_from_summary(summary_path: Path) -> list[KernelItem]:
             # Skip failed generations
             continue
         sid = str(it.get("id", ""))
+        item_backend = str(it.get("kernel_backend") or "triton")
+        if item_backend != expected_backend:
+            raise SystemExit(
+                f"summary backend mismatch for {sid or '<unknown>'}: "
+                f"expected {expected_backend}, got {item_backend}"
+            )
         kpath_str = it.get("kernel_path") or ""
         if not sid or not kpath_str:
             continue
@@ -101,8 +118,36 @@ def _load_kernels_from_summary(summary_path: Path) -> list[KernelItem]:
             kpath = summary_dir / kpath
         if not kpath.is_file():
             continue
-        code = _read_text(kpath)
-        items.append(KernelItem(subgraph_id=sid, kernel_path=kpath, code=code))
+        artifact_dir = it.get("artifact_dir")
+        files: dict[str, str] = {}
+        file_map = it.get("files")
+        if isinstance(file_map, dict):
+            for name, raw_path in file_map.items():
+                path = Path(str(raw_path))
+                if not path.is_absolute():
+                    path = summary_dir / path
+                if path.is_file():
+                    files[str(name)] = _read_text(path)
+        if not files and artifact_dir:
+            adir = Path(str(artifact_dir))
+            if not adir.is_absolute():
+                adir = summary_dir / adir
+            if adir.is_dir():
+                for path in adir.iterdir():
+                    if path.is_file() and path.name not in {"problem.txt"}:
+                        files[path.name] = _read_text(path)
+        if not files:
+            files = {"kernel.py": _read_text(kpath)}
+        code = files.get("kernel.py", _read_text(kpath))
+        items.append(
+            KernelItem(
+                subgraph_id=sid,
+                kernel_path=kpath,
+                code=code,
+                files=files,
+                kernel_backend=item_backend,
+            )
+        )
     if not items:
         raise SystemExit("no successful kernels in summary.json")
     return items
@@ -286,6 +331,109 @@ def _build_refinement_prompt(
     return "\n".join(lines)
 
 
+def _render_bundle_for_prompt(item: KernelItem) -> str:
+    return KernelBundle(item.files).render_for_prompt()
+
+
+def _build_musa_composition_prompt(
+    problem_code: str,
+    subgraphs: list[dict[str, Any]],
+    kernel_items: list[KernelItem],
+    target_platform: PlatformConfig,
+) -> str:
+    sections = []
+    for item in kernel_items:
+        sections.append(
+            f"### Subgraph {item.subgraph_id}\n{_render_bundle_for_prompt(item)}"
+        )
+    return textwrap.dedent(
+        f"""
+        You are given the original PyTorch problem, a list of exact fusable
+        subgraphs, and native MUSA bundles that implement individual subgraphs.
+
+        TARGET PLATFORM: {target_platform.name}
+        DEVICE STRING: {target_platform.device_string}
+
+        Compose one end-to-end native MUSA implementation for the original
+        model. You may reuse the subgraph algorithms, but emit one coherent
+        extension rather than importing multiple subgraph setup modules.
+
+        Hard requirements:
+        - Return exactly four FILE blocks and no prose: kernel.py, binding.cpp,
+          kernel.mu, and setup.py.
+        - kernel.py must expose kernel_function with the original input/weight
+          contract and load the extension built by setup.py.
+        - binding.cpp contains only PyTorch binding and launch dispatch glue.
+        - All numerical work must be implemented in kernel.mu. Do not replace
+          it with torch.nn, torch.nn.functional, or eager tensor math.
+        - setup.py must use torch_musa.utils.musa_extension.MUSAExtension and
+          BuildExtension.
+        - Keep tensors and synchronization on torch.musa and never use
+          torch.cuda APIs.
+        - When kernel.py is executed directly it must run a self-test based on
+          get_init_inputs()/get_inputs() from the original problem. Inline the
+          required reference code in kernel.py; do not import an external
+          problem file. Print PASS on success and exit with code 0.
+
+        ORIGINAL PROBLEM:
+        ```python
+        {problem_code}
+        ```
+
+        SUBGRAPHS:
+        {json.dumps(subgraphs, indent=2)}
+
+        SUBGRAPH BUNDLES:
+        {chr(10).join(sections)}
+
+        Return only the four FILE blocks.
+        """
+    ).strip()
+
+
+def _build_musa_refinement_prompt(
+    problem_code: str,
+    subgraphs: list[dict[str, Any]],
+    previous_bundle: KernelBundle,
+    error_info: dict[str, str],
+    target_platform: PlatformConfig,
+) -> str:
+    return textwrap.dedent(
+        f"""
+        Repair the native MUSA bundle below after its self-test failed. Return
+        the complete corrected bundle as exactly four FILE blocks and no prose.
+
+        TARGET PLATFORM: {target_platform.name}
+        ERROR STDOUT:
+        ```
+        {error_info.get("stdout", "")[-4000:]}
+        ```
+        ERROR STDERR:
+        ```
+        {error_info.get("stderr", "")[-4000:]}
+        ```
+
+        Preserve kernel_function's public contract. Keep computation in
+        kernel.mu, retain MUSAExtension in setup.py, and keep all tensors on
+        torch.musa. Inline the original-problem reference needed by the
+        self-test; kernel.py must print PASS on success.
+
+        ORIGINAL PROBLEM:
+        ```python
+        {problem_code}
+        ```
+
+        SUBGRAPHS:
+        {json.dumps(subgraphs, indent=2)}
+
+        CURRENT BUNDLE:
+        {previous_bundle.render_for_prompt()}
+
+        Return only FILE blocks for kernel.py, binding.cpp, kernel.mu, setup.py.
+        """
+    ).strip()
+
+
 def _auto_patch_common_triton_issues(
     code: str, target_platform: PlatformConfig
 ) -> tuple[str, bool]:
@@ -331,6 +479,144 @@ def _auto_patch_common_triton_issues(
     return patched, changed
 
 
+def _write_bundle(bundle: KernelBundle, out_dir: Path) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+    for name, content in bundle.files.items():
+        path = out_dir / name
+        path.write_text(content, encoding="utf-8")
+        paths[name] = str(path.resolve())
+    return paths
+
+
+def _compose_musa(
+    problem_path: Path,
+    subgraphs_path: Path,
+    kernels_summary_path: Path,
+    out_dir: Path,
+    model_name: str,
+    verify: bool,
+    max_iters: int,
+    target_platform: str,
+) -> dict[str, Any]:
+    if get_model_provider is None:
+        raise SystemExit("KernelAgent providers unavailable")
+    platform = get_platform(target_platform)
+    backend = get_kernel_backend("musa")
+    problem_code = _read_text(problem_path)
+    subgraphs = json.loads(_read_text(subgraphs_path))
+    if not isinstance(subgraphs, list):
+        raise SystemExit("subgraphs.json must be a JSON array")
+    kernels = _load_kernels_from_summary(kernels_summary_path, expected_backend="musa")
+    provider = get_model_provider(model_name)
+    attempts_dir = out_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    last_bundle: KernelBundle | None = None
+    last_usage = None
+    verify_info: dict[str, Any] = {}
+
+    for attempt in range(1, max_iters + 1):
+        if last_bundle is None:
+            prompt = _build_musa_composition_prompt(
+                problem_code, subgraphs, kernels, target_platform=platform
+            )
+        else:
+            prompt = _build_musa_refinement_prompt(
+                problem_code,
+                subgraphs,
+                last_bundle,
+                {
+                    "stdout": str(verify_info.get("stdout_tail", "")),
+                    "stderr": str(verify_info.get("stderr_tail", "")),
+                },
+                target_platform=platform,
+            )
+        (attempts_dir / f"attempt_{attempt}.prompt.txt").write_text(
+            prompt, encoding="utf-8"
+        )
+        response = provider.get_response(
+            model_name, [{"role": "user", "content": prompt}], max_tokens=50000
+        )
+        last_usage = response.usage
+        raw_text = response.content or ""
+        bundle = extract_kernel_bundle(raw_text)
+        if bundle is None:
+            verify_info = {
+                "verify_passed": False,
+                "verify_reason": "MUSA response did not contain FILE blocks",
+                "stderr_tail": "MUSA response did not contain FILE blocks",
+                "stdout_tail": "",
+            }
+            continue
+        try:
+            bundle.require(backend)
+        except ValueError as exc:
+            verify_info = {
+                "verify_passed": False,
+                "verify_reason": str(exc),
+                "stderr_tail": str(exc),
+                "stdout_tail": "",
+            }
+            last_bundle = bundle
+            continue
+
+        attempt_dir = attempts_dir / f"attempt_{attempt}"
+        _write_bundle(bundle, attempt_dir)
+        last_bundle = bundle
+        if verify:
+            rr = run_bundle_candidate(
+                bundle,
+                run_root=out_dir / "runs",
+                timeout_s=backend.verification_timeout_s,
+                isolated=False,
+                deny_network=False,
+                entrypoint="kernel.py",
+            )
+            stdout_tail = ""
+            stderr_tail = ""
+            try:
+                stdout_tail = rr.stdout_path.read_text(encoding="utf-8")[-4000:]
+                stderr_tail = rr.stderr_path.read_text(encoding="utf-8")[-4000:]
+            except Exception:
+                pass
+            verify_info = {
+                "verify_rc": rr.rc,
+                "verify_passed": rr.passed,
+                "verify_reason": rr.reason,
+                "validator": rr.validator_used,
+                "stdout_path": str(rr.stdout_path),
+                "stderr_path": str(rr.stderr_path),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+            }
+            if rr.passed:
+                break
+        else:
+            verify_info = {"verify_passed": True}
+            break
+
+    if last_bundle is None:
+        raise SystemExit("MUSA composer did not produce a valid bundle")
+    final_dir = out_dir / "composed_bundle"
+    files = _write_bundle(last_bundle, final_dir)
+    result: dict[str, Any] = {
+        "success": bool(verify_info.get("verify_passed", not verify)),
+        "composed_path": files.get("kernel.py"),
+        "artifact_dir": str(final_dir.resolve()),
+        "files": files,
+        "model": model_name,
+        "usage": last_usage,
+        "rounds": attempt,
+        "target_platform": target_platform,
+        "kernel_backend": "musa",
+    }
+    result.update(verify_info)
+    (out_dir / "composition_summary.json").write_text(
+        json.dumps(result, indent=2, default=str), encoding="utf-8"
+    )
+    return result
+
+
 def compose(
     problem_path: Path,
     subgraphs_path: Path,
@@ -340,6 +626,7 @@ def compose(
     verify: bool = False,
     max_iters: int = 5,
     target_platform: str = "cuda",
+    kernel_backend: str = "triton",
 ) -> dict[str, Any]:
     if get_model_provider is None:
         raise SystemExit(
@@ -347,17 +634,34 @@ def compose(
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    platform = get_platform(target_platform)
+    backend = get_kernel_backend(kernel_backend)
+    if not backend.supports_platform(platform.name):
+        raise ValueError(
+            f"Kernel backend {backend.name!r} does not support platform {platform.name!r}"
+        )
+    if backend.name == "musa":
+        return _compose_musa(
+            problem_path=problem_path,
+            subgraphs_path=subgraphs_path,
+            kernels_summary_path=kernels_summary_path,
+            out_dir=out_dir,
+            model_name=model_name,
+            verify=verify,
+            max_iters=max_iters,
+            target_platform=target_platform,
+        )
     provider = get_model_provider(model_name)
 
     # Platform
-    platform = get_platform(target_platform)
-
     # Load inputs
     problem_code = _read_text(problem_path)
     subgraphs = json.loads(_read_text(subgraphs_path))
     if not isinstance(subgraphs, list):
         raise SystemExit("subgraphs.json must be a JSON array")
-    kernels = _load_kernels_from_summary(kernels_summary_path)
+    kernels = _load_kernels_from_summary(
+        kernels_summary_path, expected_backend=backend.name
+    )
 
     attempts_dir = out_dir / "attempts"
     attempts_dir.mkdir(parents=True, exist_ok=True)
@@ -452,6 +756,7 @@ def compose(
         "usage": last_usage,
         "rounds": i,
         "target_platform": target_platform,
+        "kernel_backend": backend.name,
     }
     result.update(verify_info)
 
@@ -465,7 +770,7 @@ def compose(
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     p = argparse.ArgumentParser(
-        description="Compose end-to-end Triton kernel from subgraphs + generated kernels"
+        description="Compose an end-to-end backend kernel from subgraphs + generated kernels"
     )
     p.add_argument(
         "--problem", required=True, help="Absolute path to KernelBench problem file"
@@ -497,6 +802,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=get_platform_choices(),
         help="Target platform (default: cuda)",
     )
+    p.add_argument(
+        "--kernel-backend",
+        default="triton",
+        choices=get_kernel_backend_choices(),
+        help="Kernel source backend (default: triton)",
+    )
     p.add_argument("--max-iters", type=int, default=5, help="Max LLM refinement rounds")
     args = p.parse_args(argv)
 
@@ -525,6 +836,7 @@ def main(argv: list[str] | None = None) -> int:
             verify=args.verify,
             max_iters=args.max_iters,
             target_platform=args.target_platform,
+            kernel_backend=args.kernel_backend,
         )
         print(json.dumps(res, indent=2))
         return 0

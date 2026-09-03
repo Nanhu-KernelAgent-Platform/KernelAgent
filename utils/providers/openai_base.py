@@ -14,8 +14,9 @@
 
 """Base provider for OpenAI-compatible APIs."""
 
-from typing import Any
 import logging
+import os
+from typing import Any
 from .base import BaseProvider, LLMResponse
 from .env_config import configure_proxy_environment
 
@@ -26,6 +27,35 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
     OpenAI = None
+
+
+OPENAI_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+_REASONING_EFFORT_ALIASES = {
+    "不推理": "none",
+    "无": "none",
+    "低": "low",
+    "中": "medium",
+    "中等": "medium",
+    "高": "high",
+    "极高": "xhigh",
+    "最高": "max",
+    "最大": "max",
+}
+
+
+def normalize_reasoning_effort(value: Any) -> str | None:
+    """Normalize and validate OpenAI reasoning effort configuration."""
+
+    if value is None or value == "":
+        return None
+    normalized = str(value).strip().lower()
+    normalized = _REASONING_EFFORT_ALIASES.get(normalized, normalized)
+    if normalized not in OPENAI_REASONING_EFFORTS:
+        raise ValueError(
+            f"Unsupported OpenAI reasoning effort {value!r}. Expected one of: "
+            f"{', '.join(OPENAI_REASONING_EFFORTS)}"
+        )
+    return normalized
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -48,10 +78,67 @@ class OpenAICompatibleProvider(BaseProvider):
             self._original_proxy_env = configure_proxy_environment()
 
             # Initialize client (proxy configured via environment variables)
+            client_kwargs: dict[str, Any] = {
+                "api_key": api_key,
+                "timeout": float(os.getenv("OPENAI_TIMEOUT_S", "600")),
+            }
             if self.base_url:
-                self.client = OpenAI(api_key=api_key, base_url=self.base_url)
-            else:
-                self.client = OpenAI(api_key=api_key)
+                client_kwargs["base_url"] = self.base_url
+            self.client = OpenAI(**client_kwargs)
+
+    def _uses_responses_api(self) -> bool:
+        return os.getenv("OPENAI_WIRE_API", "chat_completions").lower() == "responses"
+
+    @staticmethod
+    def _usage_dict(response: Any) -> dict[str, Any] | None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        if hasattr(usage, "model_dump"):
+            return usage.model_dump()
+        if hasattr(usage, "dict"):
+            return usage.dict()
+        return usage if isinstance(usage, dict) else None
+
+    def _build_responses_params(
+        self, model_name: str, messages: list[dict[str, str]], **kwargs
+    ) -> dict[str, Any]:
+        effort = normalize_reasoning_effort(
+            kwargs.get("reasoning_effort")
+            or os.getenv("OPENAI_REASONING_EFFORT")
+            or ("high" if kwargs.get("high_reasoning_effort") else None)
+        )
+        params: dict[str, Any] = {
+            "model": model_name,
+            "input": messages,
+            "max_output_tokens": min(
+                kwargs.get("max_tokens", 8192),
+                self.get_max_tokens_limit(model_name),
+            ),
+            "store": False,
+        }
+        if effort:
+            params["reasoning"] = {"effort": effort}
+        return params
+
+    def _get_responses_response(
+        self, model_name: str, messages: list[dict[str, str]], **kwargs
+    ) -> LLMResponse:
+        response = self.client.responses.create(
+            **self._build_responses_params(model_name, messages, **kwargs)
+        )
+        logging.getLogger(__name__).info(
+            "OpenAI Responses response: id=%s model=%s",
+            getattr(response, "id", None),
+            getattr(response, "model", model_name),
+        )
+        return LLMResponse(
+            content=getattr(response, "output_text", "") or "",
+            model=getattr(response, "model", model_name),
+            provider=self.name,
+            usage=self._usage_dict(response),
+            response_id=getattr(response, "id", None),
+        )
 
     def get_response(
         self, model_name: str, messages: list[dict[str, str]], **kwargs
@@ -59,6 +146,9 @@ class OpenAICompatibleProvider(BaseProvider):
         """Get single response."""
         if not self.is_available():
             raise RuntimeError(f"{self.name} client not available")
+
+        if self._uses_responses_api():
+            return self._get_responses_response(model_name, messages, **kwargs)
 
         api_params = self._build_api_params(model_name, messages, **kwargs)
         response = self.client.chat.completions.create(**api_params)
@@ -71,9 +161,7 @@ class OpenAICompatibleProvider(BaseProvider):
             content=response.choices[0].message.content,
             model=model_name,
             provider=self.name,
-            usage=response.usage.dict()
-            if hasattr(response, "usage") and response.usage
-            else None,
+            usage=self._usage_dict(response),
         )
 
     def get_multiple_responses(
@@ -82,6 +170,12 @@ class OpenAICompatibleProvider(BaseProvider):
         """Get multiple responses using n parameter."""
         if not self.is_available():
             raise RuntimeError(f"{self.name} client not available")
+
+        if self._uses_responses_api():
+            return [
+                self._get_responses_response(model_name, messages, **kwargs)
+                for _ in range(n)
+            ]
 
         api_params = self._build_api_params(model_name, messages, n=n, **kwargs)
         response = self.client.chat.completions.create(**api_params)
@@ -95,9 +189,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 content=choice.message.content,
                 model=model_name,
                 provider=self.name,
-                usage=response.usage.dict()
-                if hasattr(response, "usage") and response.usage
-                else None,
+                usage=self._usage_dict(response),
             )
             for choice in response.choices
         ]
@@ -128,9 +220,13 @@ class OpenAICompatibleProvider(BaseProvider):
         if "n" in kwargs:
             params["n"] = kwargs["n"]
 
-        # Auto-enable high reasoning for GPT-5
+        configured_effort = normalize_reasoning_effort(
+            kwargs.get("reasoning_effort") or os.getenv("OPENAI_REASONING_EFFORT")
+        )
+
+        # Keep the historical high default unless explicitly configured.
         if model_name.startswith("gpt-5"):
-            params["reasoning_effort"] = "high"
+            params["reasoning_effort"] = configured_effort or "high"
         elif kwargs.get("high_reasoning_effort") and model_name.startswith(
             ("o3", "o1")
         ):

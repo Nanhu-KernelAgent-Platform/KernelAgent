@@ -20,10 +20,14 @@ from .agent import TritonKernelAgent
 from .worker import VerificationWorker
 from .manager import WorkerManager
 from .prompt_manager import PromptManager
+from .kernel_backend import KernelBackendConfig, KernelBundle, get_kernel_backend
 
 __all__ = [
     "TritonKernelAgent",
     "VerificationWorker",
     "WorkerManager",
     "PromptManager",
+    "KernelBackendConfig",
+    "KernelBundle",
+    "get_kernel_backend",
 ]

@@ -69,13 +69,24 @@ def get_model_provider(
     """
     model_name_to_config = _get_model_name_to_config()
     if model_name not in model_name_to_config:
-        # Default to RelayProvider for unknown models
+        # For unknown models, prefer OpenAIProvider if the user has configured
+        # an OpenAI-compatible endpoint (e.g. DeepSeek, SiliconFlow, etc.).
         from .relay_provider import RelayProvider
+        from .openai_provider import OpenAIProvider
+
+        # Always include OpenAIProvider for unknown models so that
+        # OpenAI-compatible endpoints (DeepSeek, SiliconFlow, etc.)
+        # are attempted. The outer loop in get_model_provider will
+        # verify is_available() at call time.
+        fallback_providers: list[Type[BaseProvider]] = [
+            OpenAIProvider,
+            RelayProvider,
+        ]
 
         model_config = ModelConfig(
             name=model_name,
-            provider_classes=[RelayProvider],
-            description=f"Unknown model '{model_name}' (defaulting to Relay)",
+            provider_classes=fallback_providers,
+            description=f"Unknown model '{model_name}' (trying OpenAI-compatible endpoint)",
         )
     else:
         model_config = model_name_to_config[model_name]

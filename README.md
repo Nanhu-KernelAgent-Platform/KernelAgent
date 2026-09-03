@@ -71,8 +71,35 @@ You can export keys directly or use an `.env` file that the CLIs load automatica
 OPENAI_MODEL=gpt-5            # default model for extraction
 NUM_KERNEL_SEEDS=4            # parallel workers per kernel
 MAX_REFINEMENT_ROUNDS=10      # retry budget per worker
+KERNEL_AGENT_EXPERIENCE_DB=.kernelagent/experiences.sqlite3
 LOG_LEVEL=INFO                # logging level
 ```
+
+Kernel generation and optimization use a persistent cross-task experience
+store by default. Correctness-verified kernels, measured optimization actions,
+MCU/NCU summaries, and failed approaches are stored in the configured SQLite
+database. Later tasks retrieve experiences only from the same platform and
+kernel backend, then rank them by operator, dtype, shape, and problem
+similarity. Set `enable_experience_memory: false` in an optimization YAML
+config, or pass `enable_experience_memory=False` to the Python API, to disable
+retrieval and recording.
+
+Inspect the binary SQLite store with the read-only helper instead of opening it
+as text:
+
+```bash
+python3 scripts/show_experiences.py --operator rmsnorm --platform musa
+python3 scripts/show_experiences.py --outcome improved --json
+```
+
+Add `--show-code` to include the complete stored Kernel bundle. JSON output can
+be saved with normal shell redirection when a human-readable snapshot is needed.
+
+For MUSA, prompt enrichment remains inside the existing generation and
+optimization calls: a static problem context builder extracts the operator
+contract, the MUSA knowledge pack supplies bounded operator-family guidance,
+PromptManager selects a specialized family template, and highly compatible
+verified historical implementations may be included as generation seeds.
 
 #### LLM Providers
 KernelAgent currently supports OpenAI and Anthropic out-of-the-box. You can also use a custom OpenAI endpoint.
@@ -220,12 +247,50 @@ cd examples && python run_opt_manager.py \
 
 ## Platform Support
 
-KernelAgent supports multiple GPU platforms for Triton kernel execution:
+KernelAgent and Fuser support multiple GPU platforms and source backends:
 
 | Platform | Device String | Flag | Status |
 |----------|---------------|------|--------|
 | NVIDIA CUDA | `cuda` | `--target-platform cuda` (default) | Fully supported |
+| Moore Threads MUSA | `musa` | `--target-platform musa` | Triton and native MUSA backend |
 | Intel XPU | `xpu` | `--target-platform xpu` | Supported |
+
+Fuser keeps the source backend separate from the target platform. The default
+`--kernel-backend triton` path is unchanged. Native MUSA generation is enabled
+explicitly with `--target-platform musa --kernel-backend musa`; it produces a
+validated bundle containing `kernel.py`, `binding.cpp`, `kernel.mu`, and
+`setup.py`. The existing `--target-platform musa --kernel-backend triton`
+combination remains available for MUSA-compatible Triton kernels.
+
+### Native MUSA PPT Demo
+
+The sigmoid presentation demo runs AutoRoute, native MUSA generation,
+correctness verification, MCU-guided optimization, re-verification, benchmarking,
+and experience persistence with one command:
+
+```bash
+bash examples/run_ppt_demo.sh \
+  --problem examples/optimize_04_musa_sigmoid/problem.py \
+  --allow-third-party-api \
+  --reasoning-effort low
+```
+
+Each run is retained under `examples/results/run_<timestamp>_<pid>/` by default.
+Use `--problem /abs/path/to/problem.py` for a custom KernelBench-style problem
+and `--output-root /abs/path/to/results` to select another run root. The directory
+contains `demo.log`, `demo_summary.json`, profiler logs, the generated bundle,
+and a materialized `best_bundle/`. To retry optimization without paying the
+generation cost again, pass a previous result directory:
+
+```bash
+bash examples/run_ppt_demo.sh \
+  --allow-third-party-api \
+  --reuse-generated examples/results/run_<id>
+```
+
+The final status distinguishes an improvement (`SUCCESS`), a valid candidate
+that did not beat the baseline (`NO_GAIN`), profiler/worker degradation
+(`DEGRADED`), and a hard failure (`FAILED`).
 
 ### Intel XPU Notes
 

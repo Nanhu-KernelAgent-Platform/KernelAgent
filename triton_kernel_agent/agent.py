@@ -28,6 +28,19 @@ from .prompt_manager import PromptManager
 from utils.providers import BaseProvider, get_model_provider
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
+from triton_kernel_agent.kernel_backend import (
+    KernelBundle,
+    extract_kernel_bundle,
+    get_kernel_backend,
+)
+from triton_kernel_agent.experience import (
+    ExperienceRecord,
+    SQLiteExperienceStore,
+    build_operator_signature,
+    collect_environment,
+    format_experience_context,
+    format_verified_seed_context,
+)
 
 
 class TritonKernelAgent:
@@ -44,6 +57,9 @@ class TritonKernelAgent:
         target_platform: PlatformConfig | None = None,
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
+        kernel_backend: str = "triton",
+        experience_db_path: str | Path | None = None,
+        enable_experience_memory: bool = True,
     ):
         """
         Initialize the Triton Kernel Agent.
@@ -93,12 +109,28 @@ class TritonKernelAgent:
         )
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
+        self._kernel_backend = get_kernel_backend(kernel_backend)
+        if not self._kernel_backend.supports_platform(self._platform_config.name):
+            raise ValueError(
+                f"Backend {kernel_backend!r} does not support "
+                f"platform {self._platform_config.name!r}"
+            )
+        self.experience_store = None
+        if enable_experience_memory:
+            db_path = experience_db_path or os.getenv(
+                "KERNEL_AGENT_EXPERIENCE_DB",
+                str(Path.cwd() / ".kernelagent" / "experiences.sqlite3"),
+            )
+            self.experience_store = SQLiteExperienceStore(db_path)
 
         # Setup main logger
         self._setup_logging()
 
         # Initialize prompt manager
-        self.prompt_manager = PromptManager(target_platform=target_platform)
+        self.prompt_manager = PromptManager(
+            target_platform=self._platform_config,
+            kernel_backend=self._kernel_backend,
+        )
 
         # Initialize worker manager
         self.manager = WorkerManager(
@@ -111,6 +143,7 @@ class TritonKernelAgent:
             target_platform=self._platform_config.name,
             no_cusolver=self.no_cusolver,
             test_timeout_s=self.test_timeout_s,
+            kernel_backend=self._kernel_backend.name,
         )
 
     def _setup_logging(self):
@@ -335,8 +368,12 @@ if __name__ == "__main__":
         return test_code
 
     def _generate_kernel_seeds(
-        self, problem_description: str, test_code: str, num_seeds: int | None = None
-    ) -> list[str]:
+        self,
+        problem_description: str,
+        test_code: str,
+        num_seeds: int | None = None,
+        response_log_dir: Path | None = None,
+    ) -> list[str | KernelBundle]:
         """
         Generate initial kernel implementations using OpenAI API.
 
@@ -364,9 +401,67 @@ if __name__ == "__main__":
                     test_code=test_code,
                     no_cusolver=self.no_cusolver,
                 )
+                if self.experience_store is not None:
+                    signature = build_operator_signature(problem_description)
+                    experiences = self.experience_store.search(
+                        signature,
+                        platform=self._platform_config.name,
+                        kernel_backend=self._kernel_backend.name,
+                        limit=3,
+                    )
+                    experience_context = format_experience_context(experiences)
+                    verified_seeds = self.experience_store.search_verified_seeds(
+                        signature,
+                        platform=self._platform_config.name,
+                        kernel_backend=self._kernel_backend.name,
+                        limit=2,
+                    )
+                    seed_context = format_verified_seed_context(verified_seeds)
+                    if experience_context:
+                        prompt = (
+                            f"{prompt}\n\n{experience_context}\n\n"
+                            "Use prior experience only when compatible with the current "
+                            "contract. Follow the original output format exactly."
+                        )
+                        self.logger.info(
+                            "Added %d relevant cross-task experiences to generation prompt",
+                            len(experiences),
+                        )
+                    if seed_context:
+                        prompt = (
+                            f"{prompt}\n\n{seed_context}\n\n"
+                            "Adapt seeds to the current structured contract and return "
+                            "the complete required output format."
+                        )
+                        self.logger.info(
+                            "Added %d verified implementation seeds",
+                            len(verified_seeds),
+                        )
 
                 kernels = []
                 messages = [{"role": "user", "content": prompt}]
+                invalid_musa_responses: list[tuple[int, str]] = []
+
+                def extract_seed(response_text: str, seed_index: int, label: str):
+                    try:
+                        return self._extract_kernel_payload(response_text)
+                    except ValueError as exc:
+                        bundle = extract_kernel_bundle(response_text)
+                        recognized = sorted(bundle.files) if bundle else []
+                        saved_path = None
+                        if response_log_dir is not None:
+                            saved_path = response_log_dir / f"{label}.txt"
+                            saved_path.write_text(response_text, encoding="utf-8")
+                        self.logger.error(
+                            "Invalid MUSA kernel seed %d: %s; recognized files=%s; "
+                            "raw response saved to %s",
+                            seed_index,
+                            exc,
+                            recognized,
+                            saved_path or "(response log directory unavailable)",
+                        )
+                        invalid_musa_responses.append((seed_index, response_text))
+                        return None
 
                 # Use provider's multiple response capability
                 max_completion_tokens = 20000
@@ -383,15 +478,17 @@ if __name__ == "__main__":
                     )
 
                     for i, response in enumerate(responses):
-                        kernel_code = self._extract_code_from_response(
-                            response.content,
-                            prefer_kernel_function=self._has_multiple_tests,
+                        kernel_code = extract_seed(
+                            response.content, i, f"seed_{i}_invalid_response"
                         )
                         if kernel_code:
                             kernels.append(kernel_code)
                         else:
                             self.logger.warning(
-                                f"Failed to extract code from kernel seed {i}"
+                                "Failed to extract code from kernel seed %d; "
+                                "response preview: %r",
+                                i,
+                                response.content[:2000],
                             )
                 else:
                     # Provider doesn't support multiple completions, make individual calls
@@ -401,9 +498,8 @@ if __name__ == "__main__":
                             max_tokens=max_completion_tokens,
                             temperature=0.8 + (i * 0.1),
                         )
-                        kernel_code = self._extract_code_from_response(
-                            response_text,
-                            prefer_kernel_function=self._has_multiple_tests,
+                        kernel_code = extract_seed(
+                            response_text, i, f"seed_{i}_invalid_response"
                         )
 
                         if kernel_code:
@@ -412,6 +508,48 @@ if __name__ == "__main__":
                             self.logger.warning(
                                 f"Failed to extract code from kernel seed {i}"
                             )
+
+                if (
+                    not kernels
+                    and self._kernel_backend.name == "musa"
+                    and invalid_musa_responses
+                ):
+                    seed_index, invalid_response = invalid_musa_responses[-1]
+                    self.logger.info(
+                        "Requesting one complete-format repair for MUSA kernel seed %d",
+                        seed_index,
+                    )
+                    repair_messages = [
+                        *messages,
+                        {"role": "assistant", "content": invalid_response},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Regenerate the complete native MUSA bundle. The prior "
+                                "answer was incomplete or used unsupported file headers. "
+                                "Return all four files with the literal headers "
+                                "FILE: kernel.py, FILE: binding.cpp, FILE: kernel.mu, and "
+                                "FILE: setup.py. Put each header immediately before its "
+                                "fenced code block and return no prose."
+                            ),
+                        },
+                    ]
+                    repaired_response = self._call_llm(
+                        repair_messages,
+                        max_tokens=max_completion_tokens,
+                        temperature=0.2,
+                    )
+                    repaired_kernel = extract_seed(
+                        repaired_response,
+                        seed_index,
+                        f"seed_{seed_index}_repair_invalid_response",
+                    )
+                    if repaired_kernel:
+                        kernels.append(repaired_kernel)
+                        self.logger.info(
+                            "Successfully repaired MUSA kernel seed %d output format",
+                            seed_index,
+                        )
 
                 if kernels:
                     self.logger.info(
@@ -429,6 +567,10 @@ if __name__ == "__main__":
                 # Fall back to mock implementation
 
         # Mock kernel generation (fallback)
+        if self._kernel_backend.name != "triton":
+            raise RuntimeError(
+                f"No valid {self._kernel_backend.display_name} bundle was generated"
+            )
         self.logger.info(f"Generating {num_seeds} kernel seeds (mock implementation)")
 
         kernels = []
@@ -458,6 +600,17 @@ def kernel_function(*args, **kwargs):
             kernels.append(kernel)
 
         return kernels
+
+    def _extract_kernel_payload(self, response_text: str) -> str | KernelBundle | None:
+        if self._kernel_backend.name == "musa":
+            bundle = extract_kernel_bundle(response_text)
+            if bundle is not None:
+                bundle.require(self._kernel_backend)
+            return bundle
+        return self._extract_code_from_response(
+            response_text,
+            prefer_kernel_function=self._has_multiple_tests,
+        )
 
     def generate_kernel(
         self,
@@ -520,13 +673,20 @@ def kernel_function(*args, **kwargs):
 
         # Generate kernel seeds (all tests as LLM context, with labels)
         kernel_seeds = self._generate_kernel_seeds(
-            problem_description, format_test_code_for_llm(test_code_list)
+            problem_description,
+            format_test_code_for_llm(test_code_list),
+            response_log_dir=session_dir,
         )
 
         # Save seeds
         for i, kernel in enumerate(kernel_seeds):
-            with open(session_dir / f"seed_{i}.py", "w") as f:
-                f.write(kernel)
+            if isinstance(kernel, KernelBundle):
+                seed_dir = session_dir / f"seed_{i}"
+                seed_dir.mkdir()
+                for name, content in kernel.files.items():
+                    (seed_dir / name).write_text(content, encoding="utf-8")
+            else:
+                (session_dir / f"seed_{i}.py").write_text(kernel, encoding="utf-8")
 
         # Run parallel verification with session directory for worker logs
         result = self.manager.run_verification(
@@ -541,12 +701,42 @@ def kernel_function(*args, **kwargs):
             self.logger.info(f"Success! Worker {result['worker_id']} found solution")
 
             # Save successful kernel
-            with open(session_dir / "final_kernel.py", "w") as f:
-                f.write(result["kernel_code"])
+            payload = result["kernel_code"]
+            if isinstance(payload, dict):
+                final_dir = session_dir / "final_kernel"
+                final_dir.mkdir()
+                for name, content in payload.items():
+                    (final_dir / name).write_text(content, encoding="utf-8")
+            else:
+                (session_dir / "final_kernel.py").write_text(payload, encoding="utf-8")
 
             # Save full result
             with open(session_dir / "result.json", "w") as f:
                 json.dump(result, f, indent=2)
+
+            if self.experience_store is not None:
+                payload = result["kernel_code"]
+                stored_code = (
+                    KernelBundle(payload).render_for_prompt()
+                    if isinstance(payload, dict)
+                    else payload
+                )
+                self.experience_store.add(
+                    ExperienceRecord(
+                        signature=build_operator_signature(problem_description),
+                        platform=self._platform_config.name,
+                        kernel_backend=self._kernel_backend.name,
+                        outcome="generated",
+                        kernel_code=stored_code,
+                        verified=True,
+                        action="Generated a correctness-verified kernel",
+                        lesson="Reuse only after validating shape, dtype, and device constraints.",
+                        environment={
+                            **collect_environment(),
+                            "model": self.model_name,
+                        },
+                    )
+                )
 
             return {
                 "success": True,

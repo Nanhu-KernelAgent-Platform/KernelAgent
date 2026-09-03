@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -113,6 +114,32 @@ class EventAdapter:
         with self._lock:
             self._flush()
 
+    def _create_non_streaming(
+        self, client: Any, params: dict[str, Any]
+    ) -> tuple[str, str | None]:
+        """Use Responses.create for relays whose custom SSE events break the SDK."""
+
+        response = client.responses.create(**params)
+        output_text = getattr(response, "output_text", "") or ""
+        response_id = getattr(response, "id", None)
+        if output_text and self.on_delta:
+            try:
+                self.on_delta(output_text)
+            except Exception:
+                pass
+        self._append_event(
+            StreamDelta(
+                time.time(),
+                "response.completed",
+                {
+                    "response_id": response_id,
+                    "transport": "non_streaming",
+                    "output_chars": len(output_text),
+                },
+            )
+        )
+        return output_text, response_id
+
     def stream(
         self,
         system_prompt: str,
@@ -155,69 +182,96 @@ class EventAdapter:
             params["store"] = True
 
         try:
-            with client.responses.stream(**params) as stream:  # type: ignore[attr-defined]
-                for event in stream:
-                    if self.stop_event.is_set():
-                        # cooperative cancel
-                        self._append_event(StreamDelta(time.time(), "canceled", {}))
-                        break
-                    # Determine event kind/type
-                    kind = (
-                        getattr(event, "type", None)
-                        or getattr(event, "event", None)
-                        or "unknown"
-                    )
-                    data: dict[str, Any] = {}
+            stream_enabled = os.getenv("OPENAI_RESPONSES_STREAM", "1").strip().lower()
+            if stream_enabled in {"0", "false", "no", "off"}:
+                text, response_id = self._create_non_streaming(client, params)
+                output_text_parts.append(text)
+            else:
+                with client.responses.stream(**params) as stream:  # type: ignore[attr-defined]
+                    for event in stream:
+                        if self.stop_event.is_set():
+                            # cooperative cancel
+                            self._append_event(StreamDelta(time.time(), "canceled", {}))
+                            break
+                        # Determine event kind/type
+                        kind = (
+                            getattr(event, "type", None)
+                            or getattr(event, "event", None)
+                            or "unknown"
+                        )
+                        data: dict[str, Any] = {}
 
-                    # Handle textual deltas per Responses API
-                    if kind == "response.output_text.delta":
-                        delta = getattr(event, "delta", None)
-                        if isinstance(delta, str) and delta:
-                            output_text_parts.append(delta)
-                            if self.on_delta:
-                                try:
-                                    self.on_delta(delta)
-                                except Exception:
-                                    pass
-                            data["delta"] = delta
+                        # Handle textual deltas per Responses API
+                        if kind == "response.output_text.delta":
+                            delta = getattr(event, "delta", None)
+                            if isinstance(delta, str) and delta:
+                                output_text_parts.append(delta)
+                                if self.on_delta:
+                                    try:
+                                        self.on_delta(delta)
+                                    except Exception:
+                                        pass
+                                data["delta"] = delta
 
-                    # Handle completed and IDs
-                    if kind == "response.completed" and hasattr(event, "response"):
-                        try:
-                            response_id = getattr(
-                                getattr(event, "response"), "id", None
-                            )
-                            if response_id:
-                                data["response_id"] = response_id
-                        except Exception:
-                            pass
+                        # Handle completed and IDs
+                        if kind == "response.completed" and hasattr(event, "response"):
+                            try:
+                                response_id = getattr(
+                                    getattr(event, "response"), "id", None
+                                )
+                                if response_id:
+                                    data["response_id"] = response_id
+                            except Exception:
+                                pass
 
-                    # Handle error events
-                    if kind == "response.error" and hasattr(event, "error"):
-                        try:
-                            err_obj = getattr(event, "error")
-                            msg = getattr(err_obj, "message", None)
-                            data["error"] = (
-                                msg if isinstance(msg, str) else str(err_obj)
-                            )
-                        except Exception:
-                            data["error"] = "unknown"
+                        # Handle error events
+                        if kind == "response.error" and hasattr(event, "error"):
+                            try:
+                                err_obj = getattr(event, "error")
+                                msg = getattr(err_obj, "message", None)
+                                data["error"] = (
+                                    msg if isinstance(msg, str) else str(err_obj)
+                                )
+                            except Exception:
+                                data["error"] = "unknown"
 
-                    # Fallback: best-effort ID extraction on any event
-                    if not data.get("response_id") and hasattr(event, "response"):
-                        try:
-                            rid = getattr(getattr(event, "response"), "id", None)
-                            if rid:
-                                data["response_id"] = rid
-                        except Exception:
-                            pass
+                        # Fallback: best-effort ID extraction on any event
+                        if not data.get("response_id") and hasattr(event, "response"):
+                            try:
+                                rid = getattr(getattr(event, "response"), "id", None)
+                                if rid:
+                                    data["response_id"] = rid
+                            except Exception:
+                                pass
 
-                    self._append_event(StreamDelta(time.time(), kind, data))
+                        self._append_event(StreamDelta(time.time(), kind, data))
         except Exception as e:
-            error_msg = f"stream_error: {e.__class__.__name__}: {e}"
-            self._append_event(
-                StreamDelta(time.time(), "exception", {"message": error_msg})
+            message = str(e)
+            relay_event_before_created = (
+                "Expected to have received `response.created` before" in message
             )
+            if relay_event_before_created:
+                self._append_event(
+                    StreamDelta(
+                        time.time(),
+                        "stream_fallback",
+                        {"reason": message, "transport": "non_streaming"},
+                    )
+                )
+                try:
+                    text, response_id = self._create_non_streaming(client, params)
+                    output_text_parts.append(text)
+                except Exception as fallback_error:
+                    error_msg = (
+                        "stream_fallback_error: "
+                        f"{fallback_error.__class__.__name__}: {fallback_error}"
+                    )
+            else:
+                error_msg = f"stream_error: {e.__class__.__name__}: {e}"
+            if error_msg:
+                self._append_event(
+                    StreamDelta(time.time(), "exception", {"message": error_msg})
+                )
         finally:
             done_flag.set()
             t.join(timeout=1.0)

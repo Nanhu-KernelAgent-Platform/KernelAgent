@@ -17,6 +17,12 @@
 from pathlib import Path
 
 from triton_kernel_agent.platform_config import get_platform, PlatformConfig
+from triton_kernel_agent.kernel_backend import (
+    KernelBackendConfig,
+    get_kernel_backend,
+)
+from triton_kernel_agent.musa_knowledge import MUSAKnowledgePack
+from triton_kernel_agent.prompt_context import ProblemContextBuilder
 
 try:
     from jinja2 import Environment, FileSystemLoader, Template
@@ -44,6 +50,7 @@ class PromptManager:
         self,
         templates_dir: str | None = None,
         target_platform: PlatformConfig | None = None,
+        kernel_backend: KernelBackendConfig | str = "triton",
         template_overrides: dict[str, str] | None = None,
     ):
         """
@@ -65,6 +72,18 @@ class PromptManager:
         if target_platform is None:
             target_platform = get_platform("cuda")
         self.target_platform = target_platform
+        self.kernel_backend = (
+            get_kernel_backend(kernel_backend)
+            if isinstance(kernel_backend, str)
+            else kernel_backend
+        )
+        self.problem_context_builder = ProblemContextBuilder()
+        self.musa_knowledge = MUSAKnowledgePack()
+        if not self.kernel_backend.supports_platform(target_platform.name):
+            raise ValueError(
+                f"Backend {self.kernel_backend.name!r} does not support "
+                f"platform {target_platform.name!r}"
+            )
         # Set up templates directory
         if templates_dir:
             self.templates_dir = Path(templates_dir)
@@ -89,6 +108,40 @@ class PromptManager:
         # Load templates
         self._load_templates()
 
+    @staticmethod
+    def _template_family(operator_type: str) -> str:
+        aliases = {
+            "rmsnorm": "norm",
+            "layernorm": "norm",
+            "softmax": "reduction",
+            "pooling": "reduction",
+            "group_gemm": "moe",
+            "grouped_gemm": "moe",
+            "gemm": "matmul",
+        }
+        return aliases.get(operator_type, operator_type)
+
+    def _problem_prompt_context(self, problem_description: str):
+        context = self.problem_context_builder.build(problem_description)
+        knowledge = (
+            self.musa_knowledge.retrieve(context.operator_type)
+            if self.kernel_backend.name == "musa"
+            else ""
+        )
+        return context, knowledge
+
+    def _specialized_template(self, stage: str, operator_type: str):
+        if self.kernel_backend.name != "musa":
+            return self.templates[f"kernel_{stage}"]
+        logical_name = f"kernel_{stage}"
+        if (self._template_overrides or {}).get(logical_name):
+            return self.templates[logical_name]
+        family = self._template_family(operator_type)
+        name = f"musa_kernel_{stage}_{family}.j2"
+        if (self.templates_dir / name).exists():
+            return self.env.get_template(name)
+        return self.templates[f"kernel_{stage}"]
+
     def _load_templates(self):
         """Load all available templates.
 
@@ -101,11 +154,11 @@ class PromptManager:
 
         # Define template mappings (required templates)
         template_files = {
-            "test_generation": "test_generation.j2",
-            "kernel_generation": "kernel_generation.j2",
-            "kernel_refinement": "kernel_refinement.j2",
-            "kernel_optimization": "kernel_optimization.j2",
-            "triton_guidelines": "triton_guidelines.j2",
+            "test_generation": self.kernel_backend.test_generation_template,
+            "kernel_generation": self.kernel_backend.generation_template,
+            "kernel_refinement": self.kernel_backend.refinement_template,
+            "kernel_optimization": self.kernel_backend.optimization_template,
+            "triton_guidelines": self.kernel_backend.guidelines_template,
         }
 
         # Optional templates (loaded if present)
@@ -182,7 +235,12 @@ class PromptManager:
         Returns:
             Rendered prompt string
         """
-        template = self.templates["kernel_generation"]
+        problem_context, knowledge_context = self._problem_prompt_context(
+            problem_description
+        )
+        template = self._specialized_template(
+            "generation", problem_context.operator_type
+        )
 
         # Load triton guidelines if not provided
         if triton_guidelines is None:
@@ -194,6 +252,8 @@ class PromptManager:
             triton_guidelines=triton_guidelines,
             kernel_guidance=self.target_platform.kernel_guidance,
             no_cusolver=no_cusolver,
+            structured_problem_context=problem_context.format_for_prompt(),
+            knowledge_context=knowledge_context,
         )
 
     def render_kernel_refinement_prompt(
@@ -221,6 +281,9 @@ class PromptManager:
         Returns:
             Rendered prompt string
         """
+        problem_context, knowledge_context = self._problem_prompt_context(
+            problem_description
+        )
         template = self.templates["kernel_refinement"]
 
         # Load triton guidelines if not provided
@@ -236,6 +299,8 @@ class PromptManager:
             triton_guidelines=triton_guidelines,
             kernel_guidance=self.target_platform.kernel_guidance,
             no_cusolver=no_cusolver,
+            structured_problem_context=problem_context.format_for_prompt(),
+            knowledge_context=knowledge_context,
         )
 
     def render_kernel_optimization_prompt(
@@ -281,7 +346,12 @@ class PromptManager:
         Returns:
             Rendered prompt string
         """
-        template = self.templates["kernel_optimization"]
+        problem_context, knowledge_context = self._problem_prompt_context(
+            problem_description
+        )
+        template = self._specialized_template(
+            "optimization", problem_context.operator_type
+        )
 
         bottleneck = {
             "category": category,
@@ -303,6 +373,8 @@ class PromptManager:
             recent_attempts=recent_attempts,
             reflexions=reflexions,
             rag_context=rag_context,
+            structured_problem_context=problem_context.format_for_prompt(),
+            knowledge_context=knowledge_context,
         )
 
     def render_reflexion_prompt(self, attempt) -> str:

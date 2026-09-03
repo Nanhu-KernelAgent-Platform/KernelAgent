@@ -34,6 +34,7 @@ Example:
 """
 
 import logging
+import math
 import multiprocessing as mp
 import tempfile
 from pathlib import Path
@@ -56,6 +57,13 @@ from triton_kernel_agent.opt_worker_component.searching.strategy.greedy import (
     GreedyStrategy,
 )
 from utils.config_injectable import config_injectable
+from triton_kernel_agent.experience import (
+    ExperienceRecord,
+    SQLiteExperienceStore,
+    build_operator_signature,
+    collect_environment,
+    format_experience_context,
+)
 
 # Manager-level component keys resolved by the registry
 _MANAGER_LEVEL_KEYS = {"verifier", "benchmarker", "worker_runner"}
@@ -131,6 +139,8 @@ class OptimizationManager:
         bottleneck_override: str | None = None,
         platform: dict[str, str] | str | None = None,
         gpu_ids: list[int] | None = None,
+        experience_db_path: Path | str | None = None,
+        enable_experience_memory: bool = True,
         **worker_kwargs: Any,
     ):
         """Initialize the optimization manager.
@@ -161,6 +171,16 @@ class OptimizationManager:
         self.high_reasoning_effort = high_reasoning_effort
         self.bottleneck_override = bottleneck_override
         self.worker_kwargs = worker_kwargs
+        self.experience_store = None
+        if enable_experience_memory:
+            import os
+
+            experience_path = experience_db_path or os.getenv(
+                "KERNEL_AGENT_EXPERIENCE_DB",
+                str(Path.cwd() / ".kernelagent" / "experiences.sqlite3"),
+            )
+            self.experience_store = SQLiteExperienceStore(experience_path)
+        self._active_experience_signature = None
 
         # Store template overrides (also stays in worker_kwargs for forwarding)
         self.templates_config = worker_kwargs.get("templates")
@@ -275,6 +295,12 @@ class OptimizationManager:
             k: v for k, v in config.items() if k not in _MANAGER_LEVEL_KEYS
         }
 
+        # Worker runners receive worker_kwargs during their own construction.
+        # Populate platform_config first; MusaWorkerRunner intentionally copies
+        # that mapping while adding its target/backend defaults.
+        if worker_config:
+            self.worker_kwargs["platform_config"] = worker_config
+
         # Resolve manager-level components (shared kwargs bag is
         # filtered per-factory by the registry)
         components = registry.create_from_config(
@@ -325,11 +351,8 @@ class OptimizationManager:
                         f"their baselines individually."
                     )
 
-        # Propagate worker-level config (string names) to worker
-        # processes — each worker resolves its own instances via the
-        # registry so there are no pickling issues.
-        if worker_config:
-            self.worker_kwargs["platform_config"] = worker_config
+        # Worker-level config was propagated before runner construction so
+        # copied kwargs mappings also retain it.
 
     # ------------------------------------------------------------------
     # Logging / strategy helpers (unchanged)
@@ -422,6 +445,28 @@ class OptimizationManager:
         """
         max_rounds = max_rounds or self.max_rounds
         problem_file = Path(problem_file)
+        problem_description = problem_file.read_text(encoding="utf-8")
+        self._active_experience_signature = build_operator_signature(
+            problem_description
+        )
+        if self.experience_store is not None:
+            target_platform = self.worker_kwargs.get("target_platform", "cuda")
+            kernel_backend = self.worker_kwargs.get("kernel_backend", "triton")
+            experiences = self.experience_store.search(
+                self._active_experience_signature,
+                platform=target_platform,
+                kernel_backend=kernel_backend,
+                limit=4,
+            )
+            context = format_experience_context(experiences)
+            if context:
+                self.worker_kwargs["experience_context"] = context
+                runner_kwargs = getattr(self.worker_runner, "worker_kwargs", None)
+                if isinstance(runner_kwargs, dict):
+                    runner_kwargs["experience_context"] = context
+                self.logger.info(
+                    "Loaded %d relevant cross-task experiences", len(experiences)
+                )
 
         # Normalize test_code to list
         if isinstance(test_code, str):
@@ -461,6 +506,10 @@ class OptimizationManager:
         initial_kernel_time = self._benchmark_initial_kernel(
             initial_kernel, problem_file
         )
+        # The strategy was initialized before hardware benchmarking. Update its
+        # initial entry so first-round improvement is computed against the real
+        # baseline rather than inf (which otherwise renders as nan%).
+        initial_entry.metrics.time_ms = initial_kernel_time
 
         # Round loop
         round_num = 0
@@ -482,6 +531,8 @@ class OptimizationManager:
                 test_code,
                 pytorch_baseline,
             )
+
+            self._record_experiences(results)
 
             # 3. Update strategy with results
             self.strategy.update_with_results(results, round_num)
@@ -536,6 +587,68 @@ class OptimizationManager:
                 for p in self.database.get_top_k(5)
             ],
         }
+
+    def _record_experiences(self, results: list[dict[str, Any]]) -> None:
+        if self.experience_store is None or self._active_experience_signature is None:
+            return
+        platform = self.worker_kwargs.get("target_platform", "cuda")
+        kernel_backend = self.worker_kwargs.get("kernel_backend", "triton")
+        for result in results:
+            attempt = result.get("attempt") or {}
+            kernel_code = result.get("kernel_code")
+            if not kernel_code or not attempt:
+                continue
+            verified = bool(attempt.get("passed_verification"))
+            improved = bool(attempt.get("is_improvement"))
+            measured_time = attempt.get("time_after_ms")
+            if verified and (
+                not isinstance(measured_time, (int, float))
+                or not math.isfinite(measured_time)
+                or measured_time <= 0
+            ):
+                self.logger.warning(
+                    "Skipping verified experience without a valid benchmark"
+                )
+                continue
+            outcome = (
+                "improved"
+                if improved and verified
+                else "success"
+                if verified
+                else "failed"
+            )
+            reflexion = result.get("reflexion") or {}
+            lessons = reflexion.get("lessons") or []
+            lesson = "; ".join(str(item) for item in lessons)
+            if not lesson:
+                lesson = str(reflexion.get("reasoning") or "")
+            metrics = {
+                "compute_sol_pct": attempt.get("compute_sol_pct", 0.0),
+                "memory_sol_pct": attempt.get("memory_sol_pct", 0.0),
+                "combined_sol_pct": attempt.get("combined_sol_pct", 0.0),
+            }
+            self.experience_store.add(
+                ExperienceRecord(
+                    signature=self._active_experience_signature,
+                    platform=platform,
+                    kernel_backend=kernel_backend,
+                    outcome=outcome,
+                    kernel_code=kernel_code,
+                    verified=verified,
+                    action=str(attempt.get("recommended_fix") or ""),
+                    bottleneck=str(attempt.get("bottleneck_category") or ""),
+                    lesson=lesson,
+                    error_message=str(attempt.get("error_message") or ""),
+                    baseline_time_ms=attempt.get("time_before_ms"),
+                    kernel_time_ms=measured_time,
+                    improvement_pct=attempt.get("improvement_pct"),
+                    profiler_metrics=metrics,
+                    environment={
+                        **collect_environment(),
+                        "model": result.get("openai_model", self.openai_model),
+                    },
+                )
+            )
 
     # ------------------------------------------------------------------
     # Thin delegates to platform components
@@ -651,7 +764,9 @@ class OptimizationManager:
         for pid, kernel_code in unseen.items():
             try:
                 kernel_file = baseline_dir / f"{pid}.py"
-                kernel_file.write_text(kernel_code)
+                from triton_kernel_agent.worker_util import _write_kernel_file
+
+                kernel_file = _write_kernel_file(kernel_file, kernel_code, self.logger)
 
                 profiler_results = self._mgr_profiler.profile_kernel(
                     kernel_file, problem_file, round_num
@@ -659,10 +774,17 @@ class OptimizationManager:
                 if profiler_results is None or not getattr(
                     profiler_results, "metrics", None
                 ):
-                    self._baseline_profile_cache[pid] = None
+                    # A non-None sentinel tells the worker that the manager
+                    # already attempted this exact baseline.  Without it, the
+                    # worker profiles once during baseline setup and again in
+                    # round 1, multiplying a slow MCU failure path.
+                    self._baseline_profile_cache[pid] = {
+                        "profile_failed": True,
+                        "ncu_metrics": None,
+                    }
                     self.logger.warning(
                         f"Baseline profile failed for parent {pid}; "
-                        f"workers will profile their own baselines."
+                        f"workers will use code/experience fallback analysis."
                     )
                     continue
 
@@ -684,8 +806,11 @@ class OptimizationManager:
                     f"{roofline_result.efficiency_pct:.1f}% SOL"
                 )
             except Exception as e:
-                self._baseline_profile_cache[pid] = None
+                self._baseline_profile_cache[pid] = {
+                    "profile_failed": True,
+                    "ncu_metrics": None,
+                }
                 self.logger.warning(
                     f"Baseline profile errored for parent {pid}: {e}; "
-                    f"workers will profile their own baselines."
+                    f"workers will use code/experience fallback analysis."
                 )

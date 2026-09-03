@@ -118,6 +118,17 @@ triton_kernel_logs/
 session_*/
 worker_*/
 .fuse/
+.kernelagent/
+/examples/results/
+/examples/optimize_*/results/
+
+# Local backups and one-off presentation tooling
+/kernelagent_bridge.py
+/kernelagent_bridge.py.init0828
+/scripts/fix_ppt_14_17_format.py
+/scripts/polish_ppt_v15.py
+/scripts/revise_ppt_v16.py
+/scripts/update_kernelagent_ppt.py
 
 # Generated kernels
 kernel.py

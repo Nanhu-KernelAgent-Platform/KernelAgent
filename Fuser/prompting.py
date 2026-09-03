@@ -68,11 +68,23 @@ def build_user_prompt(
     problem_file_content: str,
     error_context: str | None,
     variant_index: int,
+    target_platform: str = "cuda",
 ) -> str:
     parts: list[str] = []
     parts.append(_variant_line(variant_index))
     parts.append("")
     parts.append(BASE_DEVELOPER_PROMPT)
+    if target_platform == "musa":
+        parts.append(
+            "\nTarget platform is MUSA. Keep the fused PyTorch module and its "
+            "run_tests device-neutral, prefer device='musa' and torch.musa, "
+            "and do not introduce torch.cuda monkey patches."
+        )
+    elif target_platform == "xpu":
+        parts.append(
+            "\nTarget platform is Intel XPU. Prefer device='xpu' and torch.xpu "
+            "in generated validation code."
+        )
     parts.append("")
     parts.append(f"ATTEMPT: {attempt_index}")
     if error_context:
@@ -93,6 +105,7 @@ def render_prompt(
     enable_reasoning_extras: bool,
     seed: int | None = None,
     model_name: str | None = None,
+    target_platform: str = "cuda",
 ) -> RenderedPrompt:
     """Render system+user prompts and extras for the Responses API (deterministic)."""
     content = problem_path.read_text(encoding="utf-8")
@@ -101,6 +114,7 @@ def render_prompt(
         problem_file_content=content,
         error_context=error_context,
         variant_index=variant_index,
+        target_platform=target_platform,
     )
     extras: dict[str, Any] = {}
     if seed is not None:

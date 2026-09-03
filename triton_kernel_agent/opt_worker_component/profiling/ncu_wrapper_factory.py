@@ -55,6 +55,7 @@ class NCUWrapperFactory:
         output_dir: Path,
         dtype_inference: bool = True,
         model_extraction: bool = True,
+        target_platform: str = "cuda",
     ) -> Path:
         """
         Create NCU wrapper script for profiling.
@@ -99,6 +100,25 @@ class NCUWrapperFactory:
             dtype_inference=dtype_inference,
             model_extraction=model_extraction,
         )
+        if target_platform == "musa":
+            wrapper_content = wrapper_content.replace(
+                "import torch\n", "import torch\nimport torch_musa\n", 1
+            )
+            wrapper_content = wrapper_content.replace(
+                "if not inp.is_cuda:", 'if inp.device.type != "musa":'
+            )
+            wrapper_content = wrapper_content.replace(
+                "if not model_params['add_bias'].is_cuda:",
+                'if model_params[\'add_bias\'].device.type != "musa":',
+            )
+            wrapper_content = wrapper_content.replace(".cuda()", '.to("musa")')
+            wrapper_content = wrapper_content.replace("torch.cuda", "torch.musa")
+            # MCU application replay treats launch filters differently from
+            # NCU. Keep the profiling application to one deterministic target
+            # launch; normal benchmark warmup happens in MusaBenchmarker.
+            wrapper_content = wrapper_content.replace(
+                "WARMUP_ITERATIONS = 3", "WARMUP_ITERATIONS = 0"
+            )
 
         # Write wrapper file
         wrapper_file.write_text(wrapper_content)

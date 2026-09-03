@@ -1,0 +1,25 @@
+Optimize this native MUSA kernel bundle without changing its numerical contract.
+
+## Problem
+{{ problem_description }}
+
+{{ structured_problem_context }}
+
+{{ knowledge_context }}
+
+## Current bundle
+{{ kernel_code }}
+
+## Diagnosis
+Category: {{ bottleneck.category }}
+Summary: {{ bottleneck.summary }}
+Reasoning: {{ bottleneck.reasoning }}
+Recommended fix: {{ bottleneck.recommended_fix }}
+
+{% if rag_context %}
+## Relevant prior experience
+{{ rag_context }}
+{% endif %}
+
+Keep computation in kernel.mu and retain the MUSAExtension build. Return the
+complete kernel.py, binding.cpp, kernel.mu, and setup.py as FILE blocks only.

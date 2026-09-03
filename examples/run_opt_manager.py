@@ -26,12 +26,15 @@ history to a JSON database for analysis and resumption.
 """
 
 import argparse
+import json
+import math
 import os
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 from triton_kernel_agent.opt_manager import OptimizationManager
+from triton_kernel_agent.kernel_backend import KernelBundle, extract_kernel_bundle
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
@@ -78,7 +81,67 @@ def _run_strategy(
     )
 
 
-def print_result(result: dict, strategy_name: str, kernel_dir: Path) -> None:
+def summarize_result(result: dict) -> dict:
+    """Return a compact, serializable optimization outcome."""
+
+    initial = float(result.get("initial_kernel_time_ms", float("inf")))
+    best = float(result.get("best_time_ms", float("inf")))
+    candidate_count = len(result.get("top_kernels") or [])
+    improved = (
+        candidate_count > 0
+        and math.isfinite(initial)
+        and math.isfinite(best)
+        and best < initial
+    )
+    improvement_pct = (
+        (initial - best) / initial * 100.0
+        if math.isfinite(initial) and initial > 0 and math.isfinite(best)
+        else None
+    )
+    if not result.get("success"):
+        status = "FAILED"
+    elif candidate_count == 0:
+        status = "DEGRADED"
+    elif improved:
+        status = "SUCCESS"
+    else:
+        status = "NO_GAIN"
+    return {
+        "status": status,
+        "success": bool(result.get("success")),
+        "candidate_count": candidate_count,
+        "initial_time_ms": initial if math.isfinite(initial) else None,
+        "best_time_ms": best if math.isfinite(best) else None,
+        "pytorch_baseline_ms": result.get("pytorch_baseline_ms"),
+        "total_rounds": int(result.get("total_rounds", 0)),
+        "improvement_pct": improvement_pct,
+    }
+
+
+def write_best_kernel(result: dict, strategy_name: str, kernel_dir: Path) -> dict:
+    """Persist the serialized best kernel and a materialized native bundle."""
+
+    paths: dict[str, str | None] = {
+        "serialized_kernel": None,
+        "best_bundle_dir": None,
+    }
+    kernel_code = result.get("kernel_code")
+    if not kernel_code:
+        return paths
+    output_file = kernel_dir / f"optimized_kernel_{strategy_name.lower()}.py"
+    output_file.write_text(kernel_code, encoding="utf-8")
+    paths["serialized_kernel"] = str(output_file)
+    bundle = extract_kernel_bundle(kernel_code)
+    if bundle is not None:
+        bundle_dir = kernel_dir / "best_bundle"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in bundle.files.items():
+            (bundle_dir / name).write_text(content, encoding="utf-8")
+        paths["best_bundle_dir"] = str(bundle_dir)
+    return paths
+
+
+def print_result(result: dict, strategy_name: str, kernel_dir: Path) -> dict:
     """Print optimization result and save the best kernel."""
     if result["success"]:
         print()
@@ -95,17 +158,19 @@ def print_result(result: dict, strategy_name: str, kernel_dir: Path) -> None:
             for i, kernel in enumerate(result["top_kernels"][:3], 1):
                 print(f"  {i}. {kernel['time_ms']:.4f}ms (gen {kernel['generation']})")
 
-        # Save the best kernel
-        if result["kernel_code"]:
-            output_file = kernel_dir / f"optimized_kernel_{strategy_name.lower()}.py"
-            output_file.write_text(result["kernel_code"])
-            print(f"\nSaved optimized kernel to: {output_file}")
+        paths = write_best_kernel(result, strategy_name, kernel_dir)
+        if paths["serialized_kernel"]:
+            print(f"\nSaved optimized kernel to: {paths['serialized_kernel']}")
+        if paths["best_bundle_dir"]:
+            print(f"Materialized best bundle at: {paths['best_bundle_dir']}")
     else:
         print()
         print("=" * 80)
         print(f"{strategy_name} OPTIMIZATION FAILED")
         print("=" * 80)
         print("Check logs for details")
+        paths = {"serialized_kernel": None, "best_bundle_dir": None}
+    return {**summarize_result(result), **paths}
 
 
 def main():
@@ -130,6 +195,11 @@ def main():
         required=True,
         help="Directory containing kernel.py, problem.py, and test.py",
     )
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        help="Write a compact machine-readable result (default: <kernel-dir>/optimization_result.json)",
+    )
 
     args = parser.parse_args()
 
@@ -149,7 +219,13 @@ def main():
         sys.exit(1)
 
     # Read source files
-    kernel_code = kernel_file.read_text()
+    bundle_names = ("kernel.py", "binding.cpp", "kernel.mu", "setup.py")
+    if all((kernel_dir / name).exists() for name in bundle_names):
+        kernel_code = KernelBundle(
+            {name: (kernel_dir / name).read_text() for name in bundle_names}
+        ).render_for_prompt()
+    else:
+        kernel_code = kernel_file.read_text()
     test_code = test_file.read_text()
 
     # Print header
@@ -193,7 +269,11 @@ def main():
             log_dir,
             max_rounds=args.max_rounds,
         )
-        print_result(result, args.strategy.upper(), kernel_dir)
+        summary = print_result(result, args.strategy.upper(), kernel_dir)
+        result_json = (args.result_json or kernel_dir / "optimization_result.json").resolve()
+        result_json.parent.mkdir(parents=True, exist_ok=True)
+        result_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"Optimization result JSON: {result_json}")
 
 
 if __name__ == "__main__":

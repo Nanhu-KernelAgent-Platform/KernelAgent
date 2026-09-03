@@ -84,6 +84,7 @@ needs_model = False
 has_var_positional = False
 has_var_keyword = False
 kernel_params = []
+required_kernel_positional_count = 0
 try:
     sig = inspect.signature(kernel_function)
     kernel_params = [
@@ -91,6 +92,12 @@ try:
         if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     ]
     param_kinds = [p.kind for p in sig.parameters.values()]
+    required_kernel_positional_count = sum(
+        1 for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        and p.default is inspect.Parameter.empty
+    )
     has_var_positional = any(k == inspect.Parameter.VAR_POSITIONAL for k in param_kinds)
     has_var_keyword = any(k == inspect.Parameter.VAR_KEYWORD for k in param_kinds)
     # Check if kernel expects model-derived parameters:
@@ -218,9 +225,21 @@ def run_kernel():
                     positional_idx += 1
             return kernel_function(**bound)
     else:
-        return kernel_function(*cuda_inputs, *init_inputs)
+        # get_init_inputs() constructs Model; it is not part of Model.forward.
+        # Generated kernels normally expose only the forward inputs.  Append
+        # constructor values solely when the kernel signature explicitly has
+        # more required positional parameters than get_inputs() provides.
+        call_args = list(cuda_inputs)
+        if not has_var_positional:
+            missing = max(0, required_kernel_positional_count - len(call_args))
+            call_args.extend(init_inputs[:missing])
+        return kernel_function(*call_args)
     {% else %}
-    return kernel_function(*cuda_inputs, *init_inputs)
+    call_args = list(cuda_inputs)
+    if not has_var_positional:
+        missing = max(0, required_kernel_positional_count - len(call_args))
+        call_args.extend(init_inputs[:missing])
+    return kernel_function(*call_args)
     {% endif %}
 
 
@@ -236,7 +255,7 @@ torch.cuda.synchronize()
 {% else %}
 def run_kernel():
     """Helper to run the kernel with appropriate arguments."""
-    return kernel_function(*cuda_inputs, *init_inputs)
+    return kernel_function(*cuda_inputs)
 
 
 # Warmup phase: Complete autotuning and JIT compilation BEFORE NCU profiling

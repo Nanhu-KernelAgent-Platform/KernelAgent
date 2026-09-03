@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -50,10 +52,12 @@ class Model(nn.Module):
         return x / rms
 
 
-batch_size = 112
-features = 64
-dim1 = 512
-dim2 = 512
+# Keep the original benchmark shape by default while allowing profiling and
+# live demos to use a smaller tensor without editing this problem file.
+batch_size = int(os.getenv("RMSNORM_BATCH_SIZE", "112"))
+features = int(os.getenv("RMSNORM_FEATURES", "64"))
+dim1 = int(os.getenv("RMSNORM_DIM1", "512"))
+dim2 = int(os.getenv("RMSNORM_DIM2", "512"))
 
 
 def get_inputs():

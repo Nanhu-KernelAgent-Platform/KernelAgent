@@ -15,10 +15,27 @@
 
 """End-to-end BF16 matmul+sigmoid test harness."""
 
+import argparse
+import os
 import sys
 import time
 from dotenv import load_dotenv
 from triton_kernel_agent import TritonKernelAgent
+from triton_kernel_agent.platform_config import get_platform
+from utils.providers.openai_base import OPENAI_REASONING_EFFORTS
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kernel-backend", choices=("triton", "musa"), default="triton")
+    parser.add_argument("--target-platform", choices=("cuda", "musa", "xpu"), default="cuda")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=OPENAI_REASONING_EFFORTS,
+        default=None,
+        help="GPT-5.6 reasoning effort; overrides OPENAI_REASONING_EFFORT",
+    )
+    return parser.parse_args()
 
 
 def main():
@@ -27,16 +44,33 @@ def main():
     load_dotenv()
 
     # Create agent
-    agent = TritonKernelAgent()
+    args = parse_args()
+    if args.reasoning_effort:
+        os.environ["OPENAI_REASONING_EFFORT"] = args.reasoning_effort
+    print(
+        "Reasoning effort: "
+        f"{os.getenv('OPENAI_REASONING_EFFORT', 'provider default')}"
+    )
+    agent = TritonKernelAgent(
+        kernel_backend=args.kernel_backend,
+        target_platform=get_platform(args.target_platform),
+        test_timeout_s=180 if args.kernel_backend == "musa" else 30,
+        max_rounds=2,
+    )
 
     print("=" * 80)
     print("BF16 Matmul with Fused Sigmoid Activation")
     print("Matrix dimensions: M=1024, N=2058, K=4096")
     print("=" * 80)
 
-    # Define the problem
-    problem_description = """
-Write a fused Triton kernel for the following problem:
+    # Define the problem with backend-specific source requirements.
+    implementation_kind = (
+        "native MUSA extension bundle"
+        if args.kernel_backend == "musa"
+        else "fused Triton kernel"
+    )
+    problem_description = f"""
+Write a correct, efficient {implementation_kind} for the following problem:
 
 import torch
 import torch.nn as nn
@@ -90,19 +124,30 @@ def get_init_inputs():
         print(result["kernel_code"])
         print("=" * 80)
 
-        # Save the kernel to a file for future use
-        kernel_file = "bf16_matmul_sigmoid_kernel.py"
-        with open(kernel_file, "w") as f:
-            f.write(result["kernel_code"])
-        print(f"\n✓ Kernel saved to: {kernel_file}")
+        payload = result["kernel_code"]
+        if isinstance(payload, dict):
+            bundle_dir = os.path.join(result["session_dir"], "final_kernel")
+            print(f"\n✓ Native kernel bundle saved to: {bundle_dir}")
+            for name in sorted(payload):
+                print(f"  - {name}")
+        else:
+            kernel_file = "bf16_matmul_sigmoid_kernel.py"
+            with open(kernel_file, "w") as f:
+                f.write(payload)
+            print(f"\n✓ Kernel saved to: {kernel_file}")
+
+        # Native MUSA bundles were already compiled and verified by the agent;
+        # copying only kernel.py here would omit the compiled extension sources.
+        if isinstance(payload, dict):
+            agent.cleanup()
+            print("\n✓ E2E test completed successfully!")
+            return
 
         # Run the generated test to show performance
         print("\nRunning the generated test...")
 
         # Read the generated test code
-        import os
-
-        test_file = os.path.join(result["session_dir"], "test.py")
+        test_file = os.path.join(result["session_dir"], "test_0.py")
         with open(test_file, "r") as f:
             test_code = f.read()
 
@@ -111,10 +156,9 @@ def get_init_inputs():
         print(test_code)
         print("=" * 80)
 
-        # Create a test script that uses the generated kernel
-        # First, copy the kernel to kernel.py so the test can import it
+        # Re-run the single-file Triton artifact for a visible final check.
         with open("kernel.py", "w") as f:
-            f.write(result["kernel_code"])
+            f.write(payload)
 
         final_test_script = test_code
 

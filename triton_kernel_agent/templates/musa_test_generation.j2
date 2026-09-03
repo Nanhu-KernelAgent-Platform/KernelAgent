@@ -1,0 +1,30 @@
+Generate a complete correctness test for a native MUSA kernel bundle.
+
+## Problem
+{{ problem_description }}
+
+{% if provided_test_code %}
+## Reference test
+```python
+{{ provided_test_code }}
+```
+{% endif %}
+
+Requirements:
+- Return one complete fenced Python file and no prose.
+- Import `torch` and `torch_musa`, then import `kernel_function` from `kernel`.
+- Use device='musa' for inputs, parameters, the reference model, and outputs.
+- Check availability with `torch.musa.is_available()` and synchronize with
+  `torch.musa.synchronize()` when needed. Do not use torch.cuda APIs.
+- Call kernel_function as a normal Python function. The native extension build
+  and launch details belong to kernel.py, binding.cpp, kernel.mu, and setup.py.
+- Reproduce the exact shapes, dtypes, initialization inputs, and forward
+  semantics in the problem. Keep reference results local to the test.
+- Compare the native result with the PyTorch reference using rtol=1e-3 and
+  atol=1e-3 for fp32, or at most rtol=1e-2 and atol=2e-2 for fp16/bf16.
+- Print PASS and exit with code 0 only after numerical equivalence succeeds.
+- On failure, print useful shape/dtype/error details and exit nonzero.
+- Do not pass a reference model or precomputed expected output to
+  kernel_function.
+
+Generate the test now.
