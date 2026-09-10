@@ -387,12 +387,15 @@ class VerificationWorker:
                     timeout=self.test_timeout_s,
                 )
                 if build.returncode != 0:
-                    self.logger.error(
-                        "Native MUSA extension build failed. Exit code: %s, stderr: %s",
-                        build.returncode,
-                        build.stderr[-4000:],
+                    build_diagnostics = "\n".join(
+                        part for part in (build.stdout, build.stderr) if part
                     )
-                    return False, build.stdout, build.stderr
+                    self.logger.error(
+                        "Native MUSA extension build failed. Exit code: %s, diagnostics: %s",
+                        build.returncode,
+                        build_diagnostics[-12000:],
+                    )
+                    return False, build.stdout, build_diagnostics
                 self.logger.info("Native MUSA extension build passed")
 
             for test_file in self.test_files:

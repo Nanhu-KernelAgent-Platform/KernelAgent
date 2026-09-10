@@ -120,6 +120,9 @@ def test_kernel():
 {% if device_string == "xpu" %}
         if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
             raise RuntimeError("Intel XPU not available. Install PyTorch with Intel GPU support.")
+{% elif device_string == "musa" %}
+        if not hasattr(torch, 'musa') or not torch.musa.is_available():
+            raise RuntimeError("MUSA not available. Install torch_musa.")
 {% else %}
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA not available")

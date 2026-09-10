@@ -81,7 +81,18 @@ _MUSA_KERNEL_GUIDANCE = """\
 
 Use torch.musa APIs and MUSA-compatible Triton or native MUSA source. Do not
 leave torch.cuda calls in wrappers or tests. Native MUSA kernels must use the
-project-managed MUSAExtension build scaffold."""
+project-managed MUSAExtension build scaffold:
+- Import both `MUSAExtension` and `BuildExtension` from
+  `torch_musa.utils.musa_extension`, never `BuildExtension` from
+  `torch.utils.cpp_extension`.
+- Define `ext_modules=[MUSAExtension(... sources=['binding.cpp', 'kernel.mu'],
+  extra_compile_args={'cxx': [...], 'mcc': [...]})]`.
+- Use `cmdclass={'build_ext': BuildExtension}` in setup.py. Do not use
+  `torch.utils.cpp_extension.load`; it does not support native MUSA `.mu`
+  sources in this environment.
+- Keep the four required files exactly: kernel.py, binding.cpp, kernel.mu,
+  setup.py. The worker runs `python setup.py build_ext --inplace`.
+"""
 
 _XPU_CUDA_HACKS = (
     "torch.cuda.is_available = lambda: True",
