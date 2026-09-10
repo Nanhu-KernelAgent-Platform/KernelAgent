@@ -16,6 +16,7 @@
 
 from .base import BaseProvider, LLMResponse
 from .openai_provider import OpenAIProvider
+from .grok_provider import GrokProvider
 from .anthropic_provider import AnthropicProvider
 from .relay_provider import RelayProvider
 from .models import get_model_provider, get_available_models, is_model_available
@@ -24,6 +25,7 @@ __all__ = [
     "BaseProvider",
     "LLMResponse",
     "OpenAIProvider",
+    "GrokProvider",
     "AnthropicProvider",
     "RelayProvider",
     "get_model_provider",

@@ -16,12 +16,18 @@
 
 from utils.providers.model_config import ModelConfig
 from utils.providers.openai_provider import OpenAIProvider
+from utils.providers.grok_provider import GrokProvider
 from utils.providers.anthropic_provider import AnthropicProvider
 from utils.providers.relay_provider import RelayProvider
 
 
 # Registry of all available models (external/OSS version)
 AVAILABLE_MODELS = [
+    ModelConfig(
+        name="grok-4.6",
+        provider_classes=[GrokProvider],
+        description="xAI Grok 4.6 - coding and agentic reasoning model",
+    ),
     ModelConfig(
         name="o4-mini",
         provider_classes=[OpenAIProvider],

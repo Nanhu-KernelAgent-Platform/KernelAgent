@@ -225,7 +225,7 @@ class OpenAICompatibleProvider(BaseProvider):
         )
 
         # Keep the historical high default unless explicitly configured.
-        if model_name.startswith("gpt-5"):
+        if model_name.startswith(("gpt-5", "grok-")):
             params["reasoning_effort"] = configured_effort or "high"
         elif kwargs.get("high_reasoning_effort") and model_name.startswith(
             ("o3", "o1")
