@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from triton_kernel_agent import kernel_call_binding
 from triton_kernel_agent.kernel_backend import KernelBundle
 from triton_kernel_agent.kernel_backend import extract_kernel_bundle
 from triton_kernel_agent.platform.interfaces import (
@@ -46,8 +47,9 @@ _NORMALIZED_KEYS = {
     "occupancy": "sm__warps_active.avg.pct_of_peak_sustained_active",
 }
 
-_BENCHMARK_SCRIPT = r'''import importlib.util, json, sys, torch
+_BENCHMARK_SCRIPT = r"""import importlib.util, json, sys, torch
 import torch_musa
+from kernel_call_binding import bind_kernel_call
 
 def load(path, name):
     parent = str(__import__("pathlib").Path(path).resolve().parent)
@@ -69,18 +71,19 @@ if not isinstance(inputs, (list, tuple)): inputs = [inputs]
 inputs = [x.to("musa") if isinstance(x, torch.Tensor) else x for x in inputs]
 if mode == "kernel":
     fn = load(sys.argv[5], "musa_kernel").kernel_function
+    invoke = bind_kernel_call(fn, model, inputs)
 else:
-    fn = model
-for _ in range(warmup): fn(*inputs)
+    invoke = lambda: model(*inputs)
+for _ in range(warmup): invoke()
 torch.musa.synchronize()
 start = torch.musa.Event(enable_timing=True)
 end = torch.musa.Event(enable_timing=True)
 start.record()
-for _ in range(repeat): fn(*inputs)
+for _ in range(repeat): invoke()
 end.record()
 torch.musa.synchronize()
 print(json.dumps({"time_ms": start.elapsed_time(end) / repeat}))
-'''
+"""
 
 
 @dataclass
@@ -229,6 +232,9 @@ class MusaBenchmarker(KernelBenchmarker):
         artifacts.mkdir(parents=True, exist_ok=True)
         script = artifacts / "musa_benchmark.py"
         script.write_text(_BENCHMARK_SCRIPT, encoding="utf-8")
+        shutil.copy2(
+            Path(kernel_call_binding.__file__), artifacts / "kernel_call_binding.py"
+        )
         cmd = [
             sys.executable,
             str(script),
@@ -448,7 +454,10 @@ class MusaKernelProfiler(KernelProfilerBase):
         self.sampling_interval = (
             int(configured_interval) if configured_interval not in (None, "") else None
         )
-        if self.sampling_interval is not None and not 1 <= self.sampling_interval <= 65535:
+        if (
+            self.sampling_interval is not None
+            and not 1 <= self.sampling_interval <= 65535
+        ):
             raise ValueError("MCU sampling interval must be in [1, 65535]")
         self.semaphore = profiling_semaphore
 
@@ -772,7 +781,9 @@ class MusaKernelProfiler(KernelProfilerBase):
                     self.logger.warning(
                         "MCU profiling attempt %d (sampling interval %s) failed: %s",
                         attempt + 1,
-                        sampling_interval if sampling_interval is not None else "default",
+                        sampling_interval
+                        if sampling_interval is not None
+                        else "default",
                         exc,
                     )
             return self._load_cached_profile(kernel_file, problem_file, round_num)

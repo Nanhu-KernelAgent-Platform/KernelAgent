@@ -15,10 +15,13 @@
 """NCU wrapper script generation for kernel profiling."""
 
 import logging
+import shutil
 from functools import cached_property
 from pathlib import Path
 
 from jinja2 import Template
+
+from triton_kernel_agent import kernel_call_binding
 
 
 class NCUWrapperFactory:
@@ -109,7 +112,7 @@ class NCUWrapperFactory:
             )
             wrapper_content = wrapper_content.replace(
                 "if not model_params['add_bias'].is_cuda:",
-                'if model_params[\'add_bias\'].device.type != "musa":',
+                "if model_params['add_bias'].device.type != \"musa\":",
             )
             wrapper_content = wrapper_content.replace(".cuda()", '.to("musa")')
             wrapper_content = wrapper_content.replace("torch.cuda", "torch.musa")
@@ -122,5 +125,8 @@ class NCUWrapperFactory:
 
         # Write wrapper file
         wrapper_file.write_text(wrapper_content)
+        shutil.copy2(
+            Path(kernel_call_binding.__file__), output_dir / "kernel_call_binding.py"
+        )
         self.logger.info(f"Created NCU wrapper: {wrapper_file}")
         return wrapper_file

@@ -25,14 +25,13 @@ def test_wrapper_does_not_blindly_pass_model_init_args_to_kernel(tmp_path):
     problem = tmp_path / "problem.py"
     kernel.write_text("def kernel_function(x): return x\n")
     problem.write_text(
-        "def get_inputs(): return [object()]\n"
-        "def get_init_inputs(): return [64]\n"
+        "def get_inputs(): return [object()]\n" "def get_init_inputs(): return [64]\n"
     )
 
     wrapper = NCUWrapperFactory(logging.getLogger(__name__)).create_ncu_wrapper(
         kernel, problem, tmp_path, target_platform="musa"
     )
     code = wrapper.read_text()
-    assert "required_kernel_positional_count" in code
-    assert "missing = max(0, required_kernel_positional_count - len(call_args))" in code
+    assert "bind_kernel_call(kernel_function, model, cuda_inputs)" in code
     assert "kernel_function(*cuda_inputs, *init_inputs)" not in code
+    assert (tmp_path / "kernel_call_binding.py").is_file()

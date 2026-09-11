@@ -85,6 +85,7 @@ class OptimizationWorker:
         sol_improvement_threshold: float = 5.0,
         target_platform: str = "cuda",
         kernel_backend: str = "triton",
+        test_timeout_s: int = 30,
         roofline_config: RooflineConfig | None = None,
         # BeamSearch parameters (passed by opt_manager)
         bottleneck_id: int | None = None,
@@ -148,6 +149,7 @@ class OptimizationWorker:
         self.sol_improvement_threshold = sol_improvement_threshold
         self.target_platform = target_platform
         self.kernel_backend = kernel_backend
+        self.test_timeout_s = test_timeout_s
         self.gpu_name = gpu_name
         self.ncu_bin_path = ncu_bin_path
         self.benchmark_warmup = benchmark_warmup
@@ -347,6 +349,7 @@ class OptimizationWorker:
             high_reasoning_effort=self.high_reasoning_effort,
             target_platform=self.target_platform,
             kernel_backend=self.kernel_backend,
+            test_timeout_s=self.test_timeout_s,
         )
 
         # Roofline analyzer

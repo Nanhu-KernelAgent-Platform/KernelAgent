@@ -511,6 +511,9 @@ class OptimizationManager:
         # baseline rather than inf (which otherwise renders as nan%).
         initial_entry.metrics.time_ms = initial_kernel_time
 
+        best_mcu_profile: dict[str, Any] | None = None
+        best_profile_time = initial_kernel_time
+
         # Round loop
         round_num = 0
         for round_num in range(1, max_rounds + 1):
@@ -531,6 +534,25 @@ class OptimizationManager:
                 test_code,
                 pytorch_baseline,
             )
+
+            if best_mcu_profile is None:
+                profile = self._baseline_profile_cache.get(initial_entry.program_id)
+                if profile and not profile.get("profile_failed"):
+                    best_mcu_profile = profile
+            for result in results:
+                attempt = result.get("attempt") or {}
+                candidate_time = attempt.get("time_after_ms")
+                if (
+                    result.get("success") and attempt.get("is_improvement")
+                    and isinstance(candidate_time, (int, float))
+                    and candidate_time < best_profile_time
+                ):
+                    best_profile_time = candidate_time
+                    best_mcu_profile = {
+                        "bottleneck": attempt.get("bottleneck_category"),
+                        "compute_sol_pct": attempt.get("compute_sol_pct"),
+                        "memory_sol_pct": attempt.get("memory_sol_pct"),
+                    }
 
             self._record_experiences(results)
 
@@ -577,6 +599,11 @@ class OptimizationManager:
             "pytorch_baseline_ms": pytorch_baseline,
             "pytorch_compile_ms": pytorch_compile_time,
             "initial_kernel_time_ms": initial_kernel_time,
+            **({
+                "bottleneck": best_mcu_profile.get("bottleneck"),
+                "compute_sol_pct": best_mcu_profile.get("compute_sol_pct"),
+                "memory_sol_pct": best_mcu_profile.get("memory_sol_pct"),
+            } if best_mcu_profile else {}),
             "top_kernels": [
                 {
                     "kernel_code": p.kernel_code,
