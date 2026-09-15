@@ -92,6 +92,11 @@ project-managed MUSAExtension build scaffold:
   sources in this environment.
 - Keep the four required files exactly: kernel.py, binding.cpp, kernel.mu,
   setup.py. The worker runs `python setup.py build_ext --inplace`.
+- kernel.py must obtain the compiled module with a plain `import <name>`, where
+  `<name>` is exactly the `MUSAExtension(name=...)` value. The in-place build
+  writes an ABI-tagged file (e.g. `name.cpython-310-x86_64-linux-gnu.so`), so
+  never hard-code a `.so` filename or build a path to one, and never call
+  `torch.utils.cpp_extension.load` or re-run the build at import time.
 """
 
 _XPU_CUDA_HACKS = (

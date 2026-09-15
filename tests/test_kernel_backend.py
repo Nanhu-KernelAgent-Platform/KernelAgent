@@ -34,6 +34,29 @@ from setuptools import setup
     bundle.require(get_kernel_backend("musa"))
 
 
+def test_extract_bundle_when_model_concatenates_prose_and_first_file_header():
+    text = """I checked the implementation and will preserve its interface.FILE: kernel.py
+```python
+def kernel_function(x): return x
+```
+FILE: binding.cpp
+```cpp
+void launch();
+```
+FILE: kernel.mu
+```cpp
+__global__ void kernel() {}
+```
+FILE: setup.py
+```python
+from setuptools import setup
+```
+"""
+    bundle = extract_kernel_bundle(text)
+    assert bundle is not None
+    bundle.require(get_kernel_backend("musa"))
+
+
 def test_extract_fenced_file_header_bundle():
     response = """```FILE kernel.py
 def kernel_function():

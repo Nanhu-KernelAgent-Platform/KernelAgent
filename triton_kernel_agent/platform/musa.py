@@ -60,6 +60,7 @@ def load(path, name):
     return mod
 
 problem = load(sys.argv[1], "musa_problem")
+optimization_target = getattr(problem, "KERNELAGENT_OPTIMIZATION_TARGET", "forward")
 mode = sys.argv[2]
 warmup, repeat = int(sys.argv[3]), int(sys.argv[4])
 init_inputs = problem.get_init_inputs() if hasattr(problem, "get_init_inputs") else []
@@ -68,12 +69,22 @@ model = problem.Model(*init_inputs) if init_inputs else problem.Model()
 model = model.to("musa")
 inputs = problem.get_inputs()
 if not isinstance(inputs, (list, tuple)): inputs = [inputs]
+if optimization_target == "backward":
+    inputs = [x.detach().requires_grad_(True) if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in inputs]
 inputs = [x.to("musa") if isinstance(x, torch.Tensor) else x for x in inputs]
 if mode == "kernel":
     fn = load(sys.argv[5], "musa_kernel").kernel_function
     invoke = bind_kernel_call(fn, model, inputs)
 else:
     invoke = lambda: model(*inputs)
+if optimization_target == "backward":
+    output = invoke()
+    outputs = tuple(value for value in (output if isinstance(output, (tuple, list)) else (output,)) if isinstance(value, torch.Tensor) and value.requires_grad)
+    differentiable = tuple(value for value in (*inputs, *model.parameters()) if isinstance(value, torch.Tensor) and value.requires_grad)
+    if not outputs or not differentiable:
+        raise RuntimeError("backward benchmark requires differentiable tensor outputs and inputs")
+    grad_outputs = tuple(torch.ones_like(value) for value in outputs)
+    invoke = lambda: torch.autograd.grad(outputs, differentiable, grad_outputs=grad_outputs, retain_graph=True, allow_unused=True)
 for _ in range(warmup): invoke()
 torch.musa.synchronize()
 start = torch.musa.Event(enable_timing=True)

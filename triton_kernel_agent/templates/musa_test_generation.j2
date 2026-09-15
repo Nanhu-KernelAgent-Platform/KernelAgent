@@ -18,8 +18,17 @@ Requirements:
   `torch.musa.synchronize()` when needed. Do not use torch.cuda APIs.
 - Call kernel_function as a normal Python function. The native extension build
   and launch details belong to kernel.py, binding.cpp, kernel.mu, and setup.py.
-- Reproduce the exact shapes, dtypes, initialization inputs, and forward
-  semantics in the problem. Keep reference results local to the test.
+- When the problem defines `get_inputs()` or `get_init_inputs()`, reproduce those
+  function definitions without changing their values, shapes, dtypes, seeds, or
+  argument order, and CALL them to construct the correctness workload.
+- Instantiate `Model(*get_init_inputs())` (or `Model()` only when the factory is
+  absent/empty), then move the returned tensor inputs to MUSA without changing
+  non-tensor arguments. Pass the same logical inputs to the reference Model and
+  `kernel_function`; clone tensors when independent autograd state is required.
+- Do not replace the factory workload with hardcoded test tensors. Extra edge
+  cases are allowed only after the shared factory workload passes.
+- Reproduce the exact forward semantics in the problem. Keep reference results
+  local to the test.
 - Compare the native result with the PyTorch reference using rtol=1e-3 and
   atol=1e-3 for fp32, or at most rtol=1e-2 and atol=2e-2 for fp16/bf16.
 - Print PASS and exit with code 0 only after numerical equivalence succeeds.

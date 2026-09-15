@@ -14,6 +14,7 @@
 
 """Main Triton Kernel Generation Agent."""
 
+import ast
 import os
 import json
 import re
@@ -41,6 +42,65 @@ from triton_kernel_agent.experience import (
     format_experience_context,
     format_verified_seed_context,
 )
+
+
+def _parse_reference_problem(problem_description: str):
+    """Parse plain problem source or the Describe2 section of a combined prompt."""
+    heading = re.search(r"(?m)^## Describe2[^\n]*\n", problem_description)
+    source = problem_description[heading.end() :] if heading else problem_description
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
+def validate_generated_test_input_contract(
+    problem_description: str, test_code: str
+) -> None:
+    """Ensure a standalone generated test reuses the exact input factories."""
+    reference_tree = _parse_reference_problem(problem_description)
+    if reference_tree is None:
+        return
+    reference_functions = {
+        node.name: node
+        for node in reference_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in ("get_inputs", "get_init_inputs")
+    }
+    if not reference_functions:
+        return
+    try:
+        test_tree = ast.parse(test_code)
+    except SyntaxError as exc:
+        raise ValueError(
+            f"Generated correctness test is not valid Python: {exc}"
+        ) from exc
+    test_functions = {
+        node.name: node
+        for node in test_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    calls = {
+        node.func.id
+        for node in ast.walk(test_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    errors = []
+    for name, reference_node in reference_functions.items():
+        test_node = test_functions.get(name)
+        if test_node is None:
+            errors.append(f"{name}() definition")
+        elif ast.dump(test_node, include_attributes=False) != ast.dump(
+            reference_node, include_attributes=False
+        ):
+            errors.append(f"exact {name}() definition")
+        if name not in calls:
+            errors.append(f"{name}() call")
+    if errors:
+        raise ValueError(
+            "Generated correctness test does not reuse the problem input contract; missing or changed "
+            + ", ".join(errors)
+        )
 
 
 class TritonKernelAgent:
@@ -276,22 +336,49 @@ class TritonKernelAgent:
                     provided_test_code=provided_test_code,
                 )
 
-                # Call LLM API
+                # Call the LLM, with one focused repair attempt if it changes or skips
+                # the shared benchmark input factories.
                 messages = [{"role": "user", "content": prompt}]
-                response_text = self._call_llm(messages, max_tokens=24000)
-                self.logger.info("Raw test generation response:\n%s", response_text)
-
-                # Extract test code from response
-                test_code = self._extract_code_from_response(response_text)
-
-                if test_code:
-                    self.logger.info(
-                        f"Successfully generated test code using {self.model_name}"
+                for attempt in range(2):
+                    response_text = self._call_llm(messages, max_tokens=24000)
+                    self.logger.info("Raw test generation response:\n%s", response_text)
+                    test_code = self._extract_code_from_response(response_text)
+                    if not test_code:
+                        contract_error = ValueError(
+                            "No valid code found in LLM response"
+                        )
+                    else:
+                        try:
+                            validate_generated_test_input_contract(
+                                problem_description, test_code
+                            )
+                        except ValueError as exc:
+                            contract_error = exc
+                        else:
+                            self.logger.info(
+                                f"Successfully generated test code using {self.model_name}"
+                            )
+                            return test_code
+                    if attempt == 1:
+                        raise contract_error
+                    self.logger.warning(
+                        "Generated test violated the input contract; retrying once: %s",
+                        contract_error,
                     )
-                    return test_code
-                else:
-                    self.logger.error("Failed to extract valid code from LLM response")
-                    raise ValueError("No valid code found in LLM response")
+                    messages.extend(
+                        [
+                            {"role": "assistant", "content": response_text},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Repair the test. " + str(contract_error) + ". "
+                                    "Copy get_inputs() and get_init_inputs() exactly from "
+                                    "Describe2 and call both factories. Return only the "
+                                    "complete fenced Python test."
+                                ),
+                            },
+                        ]
+                    )
 
             except Exception as e:
                 self.logger.error(f"Error generating test with LLM API: {e}")

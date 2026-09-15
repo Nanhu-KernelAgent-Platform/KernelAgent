@@ -1,6 +1,7 @@
 import logging
 
 from triton_kernel_agent.platform.musa import (
+    _BENCHMARK_SCRIPT,
     MusaBenchmarker,
     MusaProfilerMetadata,
     MusaProfilerResults,
@@ -40,9 +41,7 @@ def test_parse_mcu_metrics_normalizes_sol_fields():
     assert len(frame) == 2
     assert metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"] == 73.5
     assert (
-        metrics[
-            "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-        ]
+        metrics["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"]
         == 42.0
     )
 
@@ -57,9 +56,7 @@ def test_parse_mcu_13_table_with_unit_before_value():
     assert len(frame) == 3
     assert metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"] == 4.13
     assert (
-        metrics[
-            "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-        ]
+        metrics["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"]
         == 10.15
     )
     assert metrics["mcu::elapsed_cycles"] == 17325.0
@@ -73,9 +70,7 @@ def test_parse_mcu_keeps_percent_sol_when_absolute_throughput_reuses_name():
     )
     assert len(frame) == 2
     assert (
-        metrics[
-            "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-        ]
+        metrics["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"]
         == 45.32
     )
     assert metrics["mcu::memory_throughput"] == 45.32
@@ -106,6 +101,15 @@ def test_musa_benchmarker_supports_manager_and_worker_contracts(tmp_path, monkey
     )
     assert benchmarker.benchmark_kernel(bundle, problem) == 0.25
     assert benchmarker.benchmark_pytorch(problem) == {"time_ms": 0.25}
+
+
+def test_musa_benchmark_script_has_separate_backward_target():
+    assert "KERNELAGENT_OPTIMIZATION_TARGET" in _BENCHMARK_SCRIPT
+    assert "torch.autograd.grad" in _BENCHMARK_SCRIPT
+    assert "retain_graph=True" in _BENCHMARK_SCRIPT
+    assert _BENCHMARK_SCRIPT.index(
+        "invoke = bind_kernel_call"
+    ) < _BENCHMARK_SCRIPT.index("output = invoke()")
 
 
 def test_musa_verifier_preserves_rendered_bundle(tmp_path, monkeypatch):
@@ -189,9 +193,7 @@ def test_mcu_command_uses_default_sampling_and_preserves_reports(tmp_path):
 
 
 def test_mcu_detects_terminal_pfm_collection_failures():
-    assert MusaKernelProfiler._has_terminal_pfm_failure(
-        "==ERROR== pfm buffer overflow"
-    )
+    assert MusaKernelProfiler._has_terminal_pfm_failure("==ERROR== pfm buffer overflow")
     assert MusaKernelProfiler._has_terminal_pfm_failure(
         "PFM dump overlap. Please increase sampling interval"
     )

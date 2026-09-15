@@ -11,7 +11,7 @@ from typing import Mapping
 
 DEFAULT_KERNEL_BACKEND = "triton"
 _FILE_BLOCK_RE = re.compile(
-    r"(?:^|\n)[ \t]*(?:#{1,6}[ \t]+)?(?:\*{1,2})?"
+    r"(?:^|\n|(?<=[.!?]))[ \t]*(?:#{1,6}[ \t]+)?(?:\*{1,2})?"
     r"FILE[ \t]*:[ \t]*([^\r\n]+?)(?:\*{1,2})?[ \t]*\r?\n"
     r"[ \t]*```[^\r\n]*\r?\n(.*?)```",
     re.DOTALL | re.IGNORECASE,
@@ -35,8 +35,7 @@ _FENCE_FILENAME_BLOCK_RE = re.compile(
 )
 
 _CANONICAL_MUSA_FILENAMES = {
-    name.lower(): name
-    for name in ("kernel.py", "binding.cpp", "kernel.mu", "setup.py")
+    name.lower(): name for name in ("kernel.py", "binding.cpp", "kernel.mu", "setup.py")
 }
 
 
