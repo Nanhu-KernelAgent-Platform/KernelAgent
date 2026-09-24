@@ -65,6 +65,33 @@ from triton_kernel_agent.experience import (
     format_experience_context,
 )
 
+
+def _validate_target_improvement_pct(value: float | None) -> float | None:
+    """Validate and normalize an optional initial-kernel improvement target."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("target_improvement_pct must be a number between 0 and 100")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0 or normalized > 100:
+        raise ValueError("target_improvement_pct must be greater than 0 and at most 100")
+    return normalized
+
+
+def _target_improvement_reached(
+    initial_time_ms: float, best_time_ms: float, target_pct: float
+) -> bool:
+    """Return whether a verified best runtime reaches the initial-kernel target."""
+    if not math.isfinite(initial_time_ms) or initial_time_ms <= 0:
+        return False
+    if not math.isfinite(best_time_ms) or best_time_ms <= 0:
+        return False
+    target_time_ms = initial_time_ms * (1 - target_pct / 100)
+    return best_time_ms <= target_time_ms or math.isclose(
+        best_time_ms, target_time_ms, rel_tol=1e-12, abs_tol=1e-12
+    )
+
+
 # Manager-level component keys resolved by the registry
 _MANAGER_LEVEL_KEYS = {"verifier", "benchmarker", "worker_runner"}
 
@@ -423,6 +450,7 @@ class OptimizationManager:
         problem_file: Path | str,
         test_code: str | list[str],
         max_rounds: int | None = None,
+        target_improvement_pct: float | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Run optimization with the configured strategy.
@@ -433,6 +461,8 @@ class OptimizationManager:
             test_code: Test code for correctness verification. Can be a single
                 string or a list.
             max_rounds: Override max_rounds (optional)
+            target_improvement_pct: Stop after a completed round reaches this
+                percentage improvement over the initial kernel.
             **kwargs: Additional kwargs (reserved for future use)
 
         Returns:
@@ -444,6 +474,9 @@ class OptimizationManager:
                 - top_kernels: list[dict]
         """
         max_rounds = max_rounds or self.max_rounds
+        target_improvement_pct = _validate_target_improvement_pct(
+            target_improvement_pct
+        )
         problem_file = Path(problem_file)
         problem_description = problem_file.read_text(encoding="utf-8")
         self._active_experience_signature = build_operator_signature(
@@ -516,6 +549,7 @@ class OptimizationManager:
 
         # Round loop
         round_num = 0
+        target_reached = False
         for round_num in range(1, max_rounds + 1):
             self.logger.info("")
             self.logger.info(f"{'=' * 20} ROUND {round_num}/{max_rounds} {'=' * 20}")
@@ -569,10 +603,19 @@ class OptimizationManager:
             else:
                 self.logger.info(f"Round {round_num}: no successful workers")
 
-            # 4. Check termination
-            if self.strategy.should_terminate(round_num, max_rounds):
-                self.logger.info("Strategy signaled termination")
-                break
+            if target_improvement_pct is not None:
+                best_so_far = self.strategy.get_best_program()
+                if best_so_far is not None and _target_improvement_reached(
+                    initial_kernel_time,
+                    best_so_far.metrics.time_ms,
+                    target_improvement_pct,
+                ):
+                    target_reached = True
+                    self.logger.info(
+                        "Target improvement %.2f%% reached after round %d",
+                        target_improvement_pct, round_num,
+                    )
+                    break
 
         # Return best result
         best = self.strategy.get_best_program()
@@ -599,6 +642,11 @@ class OptimizationManager:
             "pytorch_baseline_ms": pytorch_baseline,
             "pytorch_compile_ms": pytorch_compile_time,
             "initial_kernel_time_ms": initial_kernel_time,
+            "target_reached": target_reached,
+            "target_improvement_pct": target_improvement_pct,
+            "termination_reason": (
+                "target_improvement_reached" if target_reached else None
+            ),
             **({
                 "bottleneck": best_mcu_profile.get("bottleneck"),
                 "compute_sol_pct": best_mcu_profile.get("compute_sol_pct"),
