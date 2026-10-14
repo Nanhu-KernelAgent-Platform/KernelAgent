@@ -416,6 +416,25 @@ class PromptManager:
 - Improvement: {attempt.improvement_pct:+.1f}%
 - NCU SOL: Compute {attempt.compute_sol_pct:.1f}%, Memory {attempt.memory_sol_pct:.1f}%
 - Passed: {attempt.passed_verification}
+- Remeasured parent: {getattr(attempt, 'evidence_baseline_ms', None)}ms
+- Parent windows: {getattr(attempt, 'baseline_samples_ms', [])}
+- Candidate windows: {getattr(attempt, 'kernel_samples_ms', [])}
+- Selected by worker: {attempt.is_improvement}
+
+Parent comparison and incumbent ranking are separate observations. Include an
+optional claims list (at most four entries), each with text, claim_type,
+predicate and conditions (object). Types/predicates are:
+performance_recommendation/candidate_improves_parent;
+performance_warning/candidate_does_not_improve_parent;
+correctness_constraint/candidate_passes_correctness or candidate_fails_correctness;
+unclassified/unknown. Limit claims to the applied change and observed contract.
+Do not infer evidence from worker selection or claim statistically proven gains.
+Use an empty claims list when no bounded statement is supported.
+Conditions may use hardware, architecture, dtype/dtypes, layout, direction,
+rank and shape only when supplied facts support them. Lists mean allowed values;
+shape dimensions may be null or inclusive min/max objects. Use {{}} when no
+explicit condition is supported; the program still restricts evidence to its
+observed domain. Put free-form applicability explanations in reasoning, not conditions.
 
 Respond with JSON containing:
 {{
@@ -425,6 +444,7 @@ Respond with JSON containing:
     "actual_outcome": "what actually happened",
     "reasoning": "why the fix worked or didn't work",
     "lessons": ["lesson 1", "lesson 2"],
+    "claims": [],
     "avoid_patterns": ["pattern to avoid"],
     "try_patterns": ["pattern to try next"]
 }}"""

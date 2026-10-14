@@ -21,4 +21,7 @@ stderr: {{ error_info.stderr }}
 {{ triton_guidelines }}
 
 Return the complete kernel.py, binding.cpp, kernel.mu, and setup.py using fenced
-FILE blocks. Return no prose.
+FILE blocks. Put each literal FILE: filename header outside and immediately
+before its code fence. Return no prose and never copy reference Models, input
+factories or tests into kernel.py. Do not repair a reference-test setup error by
+changing native arithmetic; preserve all test semantics and tolerances.

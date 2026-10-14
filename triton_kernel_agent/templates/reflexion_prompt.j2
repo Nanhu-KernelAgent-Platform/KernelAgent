@@ -28,8 +28,14 @@ Analyze this kernel optimization attempt and generate a self-reflection.
 {% endif %}
 
 ## Results
-- Performance: {{ "%.4f"|format(attempt.time_before_ms) }}ms → {{ "%.4f"|format(attempt.time_after_ms) }}ms
-- Improvement: {{ "%+.1f"|format(attempt.improvement_pct) }}%
+- Incumbent performance: {{ "%.4f"|format(attempt.time_before_ms) }}ms → {{ "%.4f"|format(attempt.time_after_ms) }}ms
+- Improvement vs incumbent: {{ "%+.1f"|format(attempt.improvement_pct) }}%
+{% if attempt.evidence_baseline_ms %}
+- Remeasured parent: {{ attempt.evidence_baseline_ms }}ms
+- Parent timing windows: {{ attempt.baseline_samples_ms }}
+- Candidate timing windows: {{ attempt.kernel_samples_ms }}
+{% endif %}
+- Selected by worker: {{ attempt.is_improvement }}
 - NCU SOL: Compute {{ "%.1f"|format(attempt.compute_sol_pct) }}%, Memory {{ "%.1f"|format(attempt.memory_sol_pct) }}%
 - Passed Verification: {{ "Yes" if attempt.passed_verification else "No" }}
 {% if not attempt.passed_verification and attempt.error_message %}
@@ -52,9 +58,36 @@ Respond with a JSON object containing the following fields:
     "actual_outcome": "Brief description of what actually happened",
     "reasoning": "Explanation of why the fix worked or didn't work, citing specific metrics",
     "lessons": ["Lesson 1 learned from this attempt", "Lesson 2..."],
+    "claims": [
+        {
+            "text": "One bounded, testable statement about the change actually attempted",
+            "claim_type": "performance_recommendation or performance_warning or correctness_constraint or unclassified",
+            "predicate": "candidate_improves_parent or candidate_does_not_improve_parent or candidate_passes_correctness or candidate_fails_correctness or unknown",
+            "conditions": {}
+        }
+    ],
     "avoid_patterns": ["Pattern or approach to avoid in future rounds"],
     "try_patterns": ["Pattern or approach to prioritize in future rounds"]
 }
 ```
+
+Return at most four claims. A performance_recommendation asserts that the applied
+change improves its remeasured parent; use candidate_improves_parent. A
+performance_warning asserts that this applied change does not improve its parent
+under the stated conditions; use candidate_does_not_improve_parent. Correctness
+constraints must explicitly declare whether the candidate passes or fails the
+tested contract. Other hypotheses and general advice are unclassified with
+predicate unknown. Return an empty claims list when no bounded statement is
+supported. Do not claim that a performance change proves a bottleneck diagnosis.
+Do not infer evidence polarity from whether the worker selected the candidate.
+Parent remeasurement and incumbent ranking are distinct. These are timing
+observations using medians, not statistically established improvements.
+Evidence relations are computed by the program; do not supply them yourself.
+Conditions may use hardware, architecture, dtype/dtypes, layout, direction,
+rank and shape only when the supplied facts support them. Lists denote allowed
+values; shape dimensions may be null or inclusive min/max objects. Use {} if
+no explicit condition is supported: observed evidence still limits applicability.
+Put free-form explanations in reasoning. Unsupported conditions remain unknown,
+and neither unknown nor conflicting conditions qualify a verified principle.
 
 Generate the JSON response:

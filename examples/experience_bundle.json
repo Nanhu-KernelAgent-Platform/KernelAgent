@@ -1,0 +1,81 @@
+{
+  "workload": {
+    "semantic_type": "rmsnorm",
+    "platform": "musa",
+    "kernel_backend": "musa",
+    "contract": {
+      "operation": "rmsnorm(x, eps=1e-6)",
+      "dtype": "bfloat16",
+      "layout": "contiguous",
+      "tolerance": {"atol": 0.01, "rtol": 0.01}
+    }
+  },
+  "run": {
+    "model": "example-model",
+    "hardware": "example-gpu",
+    "provenance": "synthetic-demo",
+    "environment": {"triton": "example-version"}
+  },
+  "attempts": [
+    {
+      "id": "first",
+      "kernel_code": "example-only: first candidate",
+      "action": "Initial candidate",
+      "outcome": "success",
+      "verified": true,
+      "measurements": [
+        {
+          "case_key": "m1024_n4096",
+          "inputs": {"shape": [1024, 4096], "dtype": "bfloat16", "layout": "contiguous"},
+          "baseline_ms": 0.21,
+          "baseline_samples_ms": [0.20, 0.21, 0.22],
+          "samples_ms": [0.20, 0.21, 0.22],
+          "verified": true,
+          "benchmark": {"method": "illustrative-only"}
+        }
+      ]
+    },
+    {
+      "id": "vectorized",
+      "parent_id": "first",
+      "kernel_code": "example-only: vectorized candidate",
+      "action": "Vectorize contiguous loads",
+      "config_changes": {"BLOCK_N": "128→256"},
+      "outcome": "improved",
+      "verified": true,
+      "measurements": [
+        {
+          "case_key": "m1024_n4096",
+          "inputs": {"shape": [1024, 4096], "dtype": "bfloat16", "layout": "contiguous"},
+          "baseline_ms": 0.21,
+          "baseline_samples_ms": [0.20, 0.21, 0.22],
+          "samples_ms": [0.15, 0.16, 0.17],
+          "verified": true,
+          "benchmark": {"method": "illustrative-only"}
+        },
+        {
+          "case_key": "m2048_n4096",
+          "inputs": {"shape": [2048, 4096], "dtype": "bfloat16", "layout": "contiguous"},
+          "baseline_ms": 0.44,
+          "baseline_samples_ms": [0.43, 0.44, 0.45],
+          "samples_ms": [0.39, 0.40, 0.41],
+          "verified": true,
+          "benchmark": {"method": "illustrative-only"}
+        }
+      ]
+    }
+  ],
+  "claims": [
+    {
+      "text": "On these contiguous RMSNorm shapes, a wider load block helped",
+      "claim_type": "performance_recommendation",
+      "predicate": "candidate_improves_parent",
+      "conditions": {"layout": "contiguous"},
+      "scope": "family",
+      "evidence": [
+        {"attempt_id": "vectorized", "case_key": "m1024_n4096", "relation": "supports"},
+        {"attempt_id": "vectorized", "case_key": "m2048_n4096", "relation": "supports"}
+      ]
+    }
+  ]
+}

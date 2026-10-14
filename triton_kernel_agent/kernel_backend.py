@@ -33,6 +33,11 @@ _FENCE_FILENAME_BLOCK_RE = re.compile(
     r"(.*?)```",
     re.DOTALL | re.IGNORECASE,
 )
+_COMMENT_FILE_BLOCK_RE = re.compile(
+    r"(?:^|\n)[ \t]*```[^\r\n]*\r?\n[ \t]*"
+    r"(?:\#|//)[ \t]*FILE[ \t]*:[ \t]*([^\r\n]+)\r?\n(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
 
 _CANONICAL_MUSA_FILENAMES = {
     name.lower(): name for name in ("kernel.py", "binding.cpp", "kernel.mu", "setup.py")
@@ -46,6 +51,9 @@ def _normalize_generated_filename(raw_name: str) -> str:
     name = re.sub(r"^(?:filename|file)[ \t]*[:=][ \t]*", "", name, flags=re.I)
     name = name.strip(" \t`*_'\"")
     name = name.removeprefix("./")
+    # Never turn a path into a harmless canonical basename during normalization.
+    if "/" in name or "\\" in name or name == "..":
+        return name
 
     # Models sometimes append a short explanation after the filename. Prefer a
     # known MUSA bundle filename when one is present instead of treating the
@@ -158,6 +166,7 @@ def extract_kernel_bundle(response_text: str) -> KernelBundle | None:
     matches.extend(_FENCED_FILE_BLOCK_RE.findall(text))
     matches.extend(_MARKDOWN_HEADING_FILE_BLOCK_RE.findall(text))
     matches.extend(_FENCE_FILENAME_BLOCK_RE.findall(text))
+    matches.extend(_COMMENT_FILE_BLOCK_RE.findall(text))
     if not matches:
         return None
     return KernelBundle(

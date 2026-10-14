@@ -14,6 +14,9 @@ Requirements:
 - Return one complete fenced Python file and no prose.
 - Import `torch` and `torch_musa`, then import `kernel_function` from `kernel`.
 - Use device='musa' for inputs, parameters, the reference model, and outputs.
+- Import `move` from `kernel_case_suite` and use `move(get_inputs(), 'musa')`
+  to transfer factory inputs. Plain tensor `.to()`/`.cuda()` can compact sliced
+  tensors. Preserve shape, dtype and strides; model.to('musa') remains valid.
 - Check availability with `torch.musa.is_available()` and synchronize with
   `torch.musa.synchronize()` when needed. Do not use torch.cuda APIs.
 - Call kernel_function as a normal Python function. The native extension build
@@ -29,11 +32,24 @@ Requirements:
   cases are allowed only after the shared factory workload passes.
 - Reproduce the exact forward semantics in the problem. Keep reference results
   local to the test.
-- Compare the native result with the PyTorch reference using rtol=1e-3 and
-  atol=1e-3 for fp32, or at most rtol=1e-2 and atol=2e-2 for fp16/bf16.
+- Preserve explicit per-case tolerances. Only when none are supplied, use
+  rtol=1e-3 and atol=1e-3 for fp32, or at most rtol=1e-2 and atol=2e-2 for fp16/bf16.
 - Print PASS and exit with code 0 only after numerical equivalence succeeds.
 - On failure, print useful shape/dtype/error details and exit nonzero.
 - Do not pass a reference model or precomputed expected output to
   kernel_function.
+- For training/backward, recompute reference outputs with torch.enable_grad().
+  Never call backward/autograd.grad on a reference evaluated under no_grad or
+  inference_mode. A no_grad forward-only comparison is fine, but its output
+  must not be reused for gradient verification.
+- Construct independent leaf reference/native inputs: move to the target device,
+  then use `move(tensor.detach(), 'musa', gradients=True)` for an independent
+  stride-preserving leaf. Preserve required strides and
+  parameter gradients; do not inspect .grad on an unintended non-leaf tensor.
+- Use the same nonuniform upstream gradient for both paths. Preserve explicit
+  case tolerances and gradient_targets rather than replacing them with defaults.
+- Distinguish a reference-test/autograd setup failure from a native numerical
+  mismatch. Do not mask errors, skip backward, loosen tolerances, or print PASS
+  just because forward passed.
 
 Generate the test now.

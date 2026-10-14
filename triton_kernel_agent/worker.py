@@ -20,6 +20,7 @@ import logging
 import multiprocessing as mp
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import deque
@@ -37,6 +38,7 @@ from triton_kernel_agent.worker_util import format_test_code_for_llm
 from utils.providers import get_model_provider
 
 from .prompt_manager import PromptManager
+from .test_validation import validate_test_autograd, validate_test_layout, validate_kernel_globals
 from .worker_util import _run_test_multiprocess
 
 
@@ -286,6 +288,12 @@ class VerificationWorker:
             wrapper = kernel_code.files.get("kernel.py", "")
             if "def kernel_function" not in wrapper:
                 return "kernel.py is missing required kernel_function definition"
+            try:
+                for name, source in kernel_code.files.items():
+                    if name.endswith(".py"):
+                        validate_kernel_globals(source)
+            except (ValueError, SyntaxError) as exc:
+                return str(exc)
             return None
         if not kernel_code or not kernel_code.strip():
             return "no Python kernel code was extracted from the model response"
@@ -304,6 +312,22 @@ class VerificationWorker:
         if not has_kernel_function:
             return "missing required top-level kernel_function definition"
 
+        try:
+            validate_kernel_globals(kernel_code)
+        except ValueError as exc:
+            return str(exc)
+
+        return None
+
+    def _test_validation_error(self, tests: list[str]) -> str | None:
+        if self._kernel_backend.name != "musa":
+            return None
+        for index, source in enumerate(tests):
+            try:
+                validate_test_autograd(source)
+                validate_test_layout(source)
+            except ValueError as exc:
+                return f"Invalid correctness test [{index}]; kernel refinement skipped: {exc}"
         return None
 
     def _write_kernel(self, kernel_code: str | KernelBundle):
@@ -334,12 +358,17 @@ class VerificationWorker:
                 entries are written to ``test_extra_{i}_kernel.py``.
         """
         self._write_kernel(kernel_code)
+        from . import case_suite, kernel_call_binding
+        shutil.copy2(case_suite.__file__, self.workdir / "kernel_case_suite.py")
+        shutil.copy2(kernel_call_binding.__file__, self.workdir / "kernel_call_binding.py")
         self.test_files = []
         for i, code in enumerate(test_code):
             name = "test_kernel.py" if i == 0 else f"test_extra_{i}_kernel.py"
             path = self.workdir / name
             path.write_text(code)
             self.test_files.append(path)
+        from .case_suite import SUITE_MARKER
+        self.test_files.sort(key=lambda path: SUITE_MARKER not in path.read_text())
         self.logger.info("Wrote kernel and %d test file(s)", len(self.test_files))
 
     def _strip_comments_and_strings(self, code: str) -> str:
@@ -372,11 +401,12 @@ class VerificationWorker:
 
     def _run_test(self) -> tuple[bool, str, str]:
         """
-        Run all test scripts sequentially (``&&`` semantics).
+        Run the explicit companion first, then remaining scripts sequentially.
 
         Returns:
             Tuple of (success, stdout, stderr)
         """
+        self.last_case_results = []
         try:
             if self._kernel_backend.name == "musa":
                 build = subprocess.run(
@@ -400,19 +430,38 @@ class VerificationWorker:
 
             for test_file in self.test_files:
                 if not test_file.exists():
-                    continue
+                    return False, "", f"Required test file missing: {test_file.name}"
+                command = [sys.executable, str(test_file)]
+                if self._kernel_backend.name == "musa":
+                    command = [sys.executable, "-c",
+                               "from kernel_case_suite import run_guarded_test; "
+                               "import sys; run_guarded_test(sys.argv[1], 'musa')", str(test_file)]
                 result = subprocess.run(
-                    [sys.executable, str(test_file)],
+                    command,
                     cwd=str(self.workdir),
                     capture_output=True,
                     text=True,
                     timeout=self.test_timeout_s,
                 )
+                from .case_suite import RESULT_PREFIX
+                for line in result.stdout.splitlines():
+                    if line.startswith(RESULT_PREFIX):
+                        rows = json.loads(line[len(RESULT_PREFIX):])
+                        if not isinstance(rows, list) or not rows:
+                            return False, result.stdout, "Explicit case report is empty or invalid"
+                        self.last_case_results = rows
+                        self.logger.info("Explicit case coverage: %s", [(row["case_key"], row["status"]) for row in rows])
+                        if any(row["status"] != "passed" for row in rows):
+                            return False, result.stdout, result.stderr or "An explicit test case failed or was missing"
+                from .case_suite import SUITE_MARKER
+                if SUITE_MARKER in test_file.read_text() and not self.last_case_results:
+                    return False, result.stdout, "Explicit case suite did not report coverage"
                 if result.returncode != 0:
                     self.logger.error(
-                        "Test %s failed. Exit code: %s, stderr: %s",
+                        "Test %s failed. Exit code: %s, stdout: %s, stderr: %s",
                         test_file.name,
                         result.returncode,
+                        result.stdout[:2000],
                         result.stderr[:2000],
                     )
                     return False, result.stdout, result.stderr
@@ -504,25 +553,38 @@ class VerificationWorker:
 
                 # Call LLM API
                 messages = [{"role": "user", "content": prompt}]
-                response_text = self._call_llm(messages, max_tokens=20000)
-
-                # Extract refined kernel from response
-                refined_kernel = (
-                    extract_kernel_bundle(response_text)
-                    if self._kernel_backend.name == "musa"
-                    else self._extract_code_from_response(
-                        response_text,
-                        prefer_kernel_function=getattr(
-                            self, "_has_multiple_tests", False
-                        ),
-                    )
-                )
-                malformed_reason = self._validate_kernel_candidate(refined_kernel)
-
-                if malformed_reason:
-                    raise ValueError(
-                        f"Malformed LLM kernel response: {malformed_reason}"
-                    )
+                for format_attempt in range(2 if self._kernel_backend.name == "musa" else 1):
+                    response_text = self._call_llm(messages, max_tokens=20000)
+                    try:
+                        refined_kernel = (
+                            extract_kernel_bundle(response_text)
+                            if self._kernel_backend.name == "musa"
+                            else self._extract_code_from_response(
+                                response_text,
+                                prefer_kernel_function=getattr(self, "_has_multiple_tests", False),
+                            )
+                        )
+                        malformed_reason = self._validate_kernel_candidate(refined_kernel)
+                    except ValueError as exc:
+                        refined_kernel = None
+                        malformed_reason = str(exc)
+                    if not malformed_reason:
+                        break
+                    # Preserve rejected output for diagnosis, with bounded format repair.
+                    (self.log_dir / f"refinement_rejected_{len(self.history)}_{format_attempt}.txt").write_text(
+                        response_text, encoding="utf-8")
+                    if self._kernel_backend.name != "musa" or format_attempt == 1:
+                        raise ValueError(f"Malformed LLM kernel response: {malformed_reason}")
+                    self.logger.warning("Malformed MUSA refinement; retrying format once: %s", malformed_reason)
+                    messages.extend([
+                        {"role": "assistant", "content": response_text},
+                        {"role": "user", "content":
+                         "Repair only the complete bundle output format. " + malformed_reason
+                         + ". Return all four files with literal FILE: kernel.py, FILE: binding.cpp, "
+                         "FILE: kernel.mu and FILE: setup.py headers immediately before fenced code. "
+                         "No prose, reference Model, input factories or test code in kernel.py. "
+                         "Preserve the public contract and do not weaken any test."},
+                    ])
 
                 if refined_kernel:
                     self.logger.info(
@@ -581,6 +643,10 @@ class VerificationWorker:
         # Add to history
         self.history.append(round_data)
 
+    def _failed_run(self, rounds: int, **details) -> dict[str, Any]:
+        return {"worker_id": self.worker_id, "success": False, "rounds": rounds,
+                "history": list(self.history), **details}
+
     def run(
         self,
         kernel_code: str | KernelBundle,
@@ -601,6 +667,10 @@ class VerificationWorker:
             Dictionary with results
         """
         self.logger.info(f"Starting verification for worker {self.worker_id}")
+        test_error = self._test_validation_error(test_code)
+        if test_error:
+            self.logger.error(test_error)
+            return self._failed_run(0, error=test_error, failure_kind="invalid_correctness_test")
         self._has_multiple_tests = len(test_code) > 1
 
         current_kernel = kernel_code
@@ -608,13 +678,7 @@ class VerificationWorker:
         if malformed_reason:
             error_feedback = f"Malformed LLM kernel response: {malformed_reason}"
             self.logger.warning(f"❌ {error_feedback}")
-            return {
-                "worker_id": self.worker_id,
-                "success": False,
-                "rounds": 0,
-                "error": error_feedback,
-                "history": list(self.history),
-            }
+            return self._failed_run(0, error=error_feedback)
 
         for round_num in range(self.max_rounds):
             # Check if another worker has succeeded
@@ -643,45 +707,7 @@ class VerificationWorker:
             )
 
             if violation:
-                self._log_round(round_num + 1, False, current_kernel, "", violation)
-                error_info = {
-                    "stdout": "",
-                    "stderr": violation,
-                    "history": list(self.history),
-                }
-                try:
-                    current_kernel = self._refine_kernel(
-                        current_kernel,
-                        error_info,
-                        problem_description,
-                        format_test_code_for_llm(test_code),
-                    )
-                except ValueError as exc:
-                    if "Malformed LLM kernel response" not in str(exc):
-                        raise
-                    error_feedback = str(exc)
-                    self.logger.warning(f"❌ {error_feedback}")
-                    return {
-                        "worker_id": self.worker_id,
-                        "success": False,
-                        "rounds": round_num + 1,
-                        "error": error_feedback,
-                        "history": list(self.history),
-                    }
-                malformed_reason = self._validate_kernel_candidate(current_kernel)
-                if malformed_reason:
-                    error_feedback = (
-                        f"Malformed LLM kernel response: {malformed_reason}"
-                    )
-                    self.logger.warning(f"❌ {error_feedback}")
-                    return {
-                        "worker_id": self.worker_id,
-                        "success": False,
-                        "rounds": round_num + 1,
-                        "error": error_feedback,
-                        "history": list(self.history),
-                    }
-                continue
+                success, stdout, stderr = False, "", violation
 
             # Log round
             self._log_round(round_num + 1, success, current_kernel, stdout, stderr)
@@ -693,6 +719,7 @@ class VerificationWorker:
                 return {
                     "worker_id": self.worker_id,
                     "success": True,
+                    "case_results": getattr(self, "last_case_results", []),
                     "kernel_code": (
                         dict(current_kernel.files)
                         if isinstance(current_kernel, KernelBundle)
@@ -716,39 +743,19 @@ class VerificationWorker:
                     problem_description,
                     format_test_code_for_llm(test_code),
                 )
+                malformed_reason = self._validate_kernel_candidate(current_kernel)
+                if malformed_reason:
+                    raise ValueError(f"Malformed LLM kernel response: {malformed_reason}")
             except ValueError as exc:
                 if "Malformed LLM kernel response" not in str(exc):
                     raise
                 error_feedback = str(exc)
                 self.logger.warning(f"❌ {error_feedback}")
-                return {
-                    "worker_id": self.worker_id,
-                    "success": False,
-                    "rounds": round_num + 1,
-                    "error": error_feedback,
-                    "history": list(self.history),
-                }
-            malformed_reason = self._validate_kernel_candidate(current_kernel)
-            if malformed_reason:
-                error_feedback = f"Malformed LLM kernel response: {malformed_reason}"
-                self.logger.warning(f"❌ {error_feedback}")
-                return {
-                    "worker_id": self.worker_id,
-                    "success": False,
-                    "rounds": round_num + 1,
-                    "error": error_feedback,
-                    "history": list(self.history),
-                }
+                return self._failed_run(round_num + 1, error=error_feedback)
 
         # Max rounds reached without success
         self.logger.warning(f"Max rounds ({self.max_rounds}) reached without success")
-        return {
-            "worker_id": self.worker_id,
-            "success": False,
-            "max_rounds_reached": True,
-            "rounds": self.max_rounds,
-            "history": list(self.history),
-        }
+        return self._failed_run(self.max_rounds, max_rounds_reached=True)
 
     def _single_verification_pass(
         self, kernel_code: str | KernelBundle
@@ -760,15 +767,18 @@ class VerificationWorker:
             Tuple of (success, stdout, stderr, violation_message)
             - violation_message is set if PyTorch usage detected, None otherwise
         """
+        self.last_case_results = []
         violation = self._detect_pytorch_compute(kernel_code)
         if violation:
             message = f"Disallowed PyTorch usage detected: {violation}"
             self.logger.error(message)
             return False, "", message, message
 
+        from .case_suite import SUITE_MARKER
+        has_suite = any(SUITE_MARKER in path.read_text() for path in self.test_files if path.exists())
         success, stdout, stderr = (
             self._run_test()
-            if os.getenv("KA_PROCESS_USE_SYS_EXECUTABLE", "1") == "1"
+            if has_suite or os.getenv("KA_PROCESS_USE_SYS_EXECUTABLE", "1") == "1"
             else _run_test_multiprocess(
                 self.logger,
                 self.workdir,
@@ -805,6 +815,12 @@ class VerificationWorker:
         """
         current_kernel = kernel_code
         self._has_multiple_tests = len(test_code) > 1
+        self.last_case_results = []
+
+        test_error = self._test_validation_error(test_code)
+        if test_error:
+            self.logger.error(test_error)
+            return False, current_kernel, test_error
 
         malformed_reason = self._validate_kernel_candidate(current_kernel)
         if malformed_reason:

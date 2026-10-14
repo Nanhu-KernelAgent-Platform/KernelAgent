@@ -84,16 +84,21 @@ similarity. Set `enable_experience_memory: false` in an optimization YAML
 config, or pass `enable_experience_memory=False` to the Python API, to disable
 retrieval and recording.
 
-Inspect the binary SQLite store with the read-only helper instead of opening it
-as text:
+Inspect experiment evidence and retrieval decisions with
+`python -m scripts.experience_db --help`. Historical implementations still need
+current-contract verification and fresh measurement before adoption; subgraph
+recall supplies text only, not reusable code.
 
-```bash
-python3 scripts/show_experiences.py --operator rmsnorm --platform musa
-python3 scripts/show_experiences.py --outcome improved --json
-```
+Only schema version 9 is supported. An old or unversioned populated database
+is rejected without automatic migration. Back it up and configure a fresh path
+through `KERNEL_AGENT_EXPERIENCE_DB` before restarting the agent. Experiments are
+written once; retrieval cases are a read-only SQL view over that ledger. Raw
+reflections cannot become principles without typed, independently validated
+claims and matching applicability conditions.
 
-Add `--show-code` to include the complete stored Kernel bundle. JSON output can
-be saved with normal shell redirection when a human-readable snapshot is needed.
+Known MUSA limitation: optimization workers can fail with "Cannot re-initialize
+MUSA in forked subprocess". This remains unresolved; successful generation or
+retrieval is not evidence that the complete optimization workflow passed.
 
 For MUSA, prompt enrichment remains inside the existing generation and
 optimization calls: a static problem context builder extracts the operator

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from jinja2 import Template
 
-from triton_kernel_agent import kernel_call_binding
+from triton_kernel_agent import case_suite, kernel_call_binding
 
 
 class NCUWrapperFactory:
@@ -100,33 +100,17 @@ class NCUWrapperFactory:
             problem_file_parent=repr(str(problem_file.parent)),
             kernel_module=kernel_file.stem,
             problem_module=problem_file.stem,
-            dtype_inference=dtype_inference,
+            dtype_inference=dtype_inference and target_platform != "musa",
             model_extraction=model_extraction,
+            target_device="musa" if target_platform == "musa" else "cuda",
+            warmup_iterations=0 if target_platform == "musa" else 3,
         )
-        if target_platform == "musa":
-            wrapper_content = wrapper_content.replace(
-                "import torch\n", "import torch\nimport torch_musa\n", 1
-            )
-            wrapper_content = wrapper_content.replace(
-                "if not inp.is_cuda:", 'if inp.device.type != "musa":'
-            )
-            wrapper_content = wrapper_content.replace(
-                "if not model_params['add_bias'].is_cuda:",
-                "if model_params['add_bias'].device.type != \"musa\":",
-            )
-            wrapper_content = wrapper_content.replace(".cuda()", '.to("musa")')
-            wrapper_content = wrapper_content.replace("torch.cuda", "torch.musa")
-            # MCU application replay treats launch filters differently from
-            # NCU. Keep the profiling application to one deterministic target
-            # launch; normal benchmark warmup happens in MusaBenchmarker.
-            wrapper_content = wrapper_content.replace(
-                "WARMUP_ITERATIONS = 3", "WARMUP_ITERATIONS = 0"
-            )
 
         # Write wrapper file
         wrapper_file.write_text(wrapper_content)
         shutil.copy2(
             Path(kernel_call_binding.__file__), output_dir / "kernel_call_binding.py"
         )
+        shutil.copy2(Path(case_suite.__file__), output_dir / "kernel_case_suite.py")
         self.logger.info(f"Created NCU wrapper: {wrapper_file}")
         return wrapper_file

@@ -34,9 +34,13 @@ Example:
 """
 
 import logging
+import hashlib
+import json
 import math
+import statistics
 import multiprocessing as mp
 import tempfile
+from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +61,8 @@ from triton_kernel_agent.opt_worker_component.searching.strategy.greedy import (
     GreedyStrategy,
 )
 from utils.config_injectable import config_injectable
+from triton_kernel_agent.experience.evidence import normalize_claims
+from triton_kernel_agent.experience.signature import declared_execution_direction
 from triton_kernel_agent.experience import (
     ExperienceRecord,
     SQLiteExperienceStore,
@@ -76,6 +82,11 @@ def _validate_target_improvement_pct(value: float | None) -> float | None:
     if not math.isfinite(normalized) or normalized <= 0 or normalized > 100:
         raise ValueError("target_improvement_pct must be greater than 0 and at most 100")
     return normalized
+
+
+def _experience_direction(problem_description: str) -> str:
+    """Read the bridge's explicit optimization target, never infer from code text."""
+    return declared_execution_direction(problem_description) or "unknown"
 
 
 def _target_improvement_reached(
@@ -346,6 +357,14 @@ class OptimizationManager:
         self.verifier = components["verifier"]
         self.benchmarker = components["benchmarker"]
         self.worker_runner = components["worker_runner"]
+        # Some runners (notably MUSA) fill in their target/backend defaults
+        # in a copied kwargs mapping. Keep the manager's experience namespace
+        # aligned with the actual worker configuration.
+        runner_kwargs = getattr(self.worker_runner, "worker_kwargs", None)
+        if isinstance(runner_kwargs, dict):
+            for key in ("target_platform", "kernel_backend"):
+                if key in runner_kwargs:
+                    self.worker_kwargs[key] = runner_kwargs[key]
 
         # Resolve a manager-owned profiler + roofline_analyzer for the
         # baseline-caching step.  These coexist with the worker-level
@@ -479,31 +498,36 @@ class OptimizationManager:
         )
         problem_file = Path(problem_file)
         problem_description = problem_file.read_text(encoding="utf-8")
-        self._active_experience_signature = build_operator_signature(
+        self._active_reference_source_digest = hashlib.sha256(
+            problem_description.encode("utf-8")
+        ).hexdigest()
+        self._active_experience_direction = _experience_direction(
             problem_description
         )
-        if self.experience_store is not None:
-            target_platform = self.worker_kwargs.get("target_platform", "cuda")
-            kernel_backend = self.worker_kwargs.get("kernel_backend", "triton")
-            experiences = self.experience_store.search(
-                self._active_experience_signature,
-                platform=target_platform,
-                kernel_backend=kernel_backend,
-                limit=4,
-            )
-            context = format_experience_context(experiences)
-            if context:
-                self.worker_kwargs["experience_context"] = context
-                runner_kwargs = getattr(self.worker_runner, "worker_kwargs", None)
-                if isinstance(runner_kwargs, dict):
-                    runner_kwargs["experience_context"] = context
-                self.logger.info(
-                    "Loaded %d relevant cross-task experiences", len(experiences)
-                )
-
+        self._active_experience_signature = build_operator_signature(
+            problem_description,
+        )
+        self._experience_session_id = uuid4().hex
+        self._experience_retrieval_id = None
+        # A manager may be reused for another operator. Never carry its old
+        # cross-task prompt into a new run with zero retrieval hits.
+        self.worker_kwargs.pop("experience_context", None)
+        runner_kwargs = getattr(self.worker_runner, "worker_kwargs", None)
+        if isinstance(runner_kwargs, dict):
+            runner_kwargs.pop("experience_context", None)
         # Normalize test_code to list
         if isinstance(test_code, str):
             test_code = [test_code]
+        from .case_suite import suite_test, SUITE_MARKER
+        test_code = [code for code in test_code if SUITE_MARKER not in code]
+        companion = suite_test(problem_file.read_text(), self._active_experience_direction,
+                               self.worker_kwargs.get("target_platform", "cuda"))
+        if companion:
+            test_code.append(companion)
+            self.logger.info("Optimization and historical seed verification require the full explicit case suite")
+        self._experience_test_hash = hashlib.sha256(
+            json.dumps(test_code, sort_keys=True).encode()
+        ).hexdigest()
 
         self.logger.info("=" * 80)
         self.logger.info("STARTING OPTIMIZATION")
@@ -529,6 +553,12 @@ class OptimizationManager:
                 "error": "Initial kernel failed correctness verification",
             }
 
+        # Probe the reference graph only after the starting kernel has passed
+        # the current problem's correctness verification.
+        self._active_experience_signature = build_operator_signature(
+            problem_description, trace_graph=True,
+        )
+
         # Benchmark PyTorch baseline once (before spawning workers)
         pytorch_baseline = self._benchmark_pytorch_baseline(problem_file)
 
@@ -536,21 +566,203 @@ class OptimizationManager:
         pytorch_compile_time = self._benchmark_pytorch_compile(problem_file)
 
         # Benchmark the initial kernel
-        initial_kernel_time = self._benchmark_initial_kernel(
+        initial_samples = self._benchmark_initial_kernel_samples(
             initial_kernel, problem_file
         )
+        initial_kernel_time = (
+            statistics.median(initial_samples) if initial_samples else float("inf")
+        )
+        measured_hardware = getattr(getattr(self, "benchmarker", None), "last_hardware", "")
+        self._active_experience_hardware = (
+            measured_hardware or self.worker_kwargs.get("hardware", "")
+        )
+        self._active_experience_hardware_source = (
+            "benchmark" if measured_hardware else "declared" if
+            self._active_experience_hardware else "unknown"
+        )
+        # Text retrieval needs the verified graph and the measured device,
+        # rather than the initial prose-only approximation.
+        if self.experience_store is not None:
+            experiences = self.experience_store.retrieve(
+                self._active_experience_signature,
+                platform=self.worker_kwargs.get("target_platform", "cuda"),
+                kernel_backend=self.worker_kwargs.get("kernel_backend", "triton"),
+                stage="optimization", limit=4,
+                hardware=self._active_experience_hardware,
+                direction=self._active_experience_direction,
+            )
+            self._experience_retrieval_id = self.experience_store.log_retrieval(
+                session_id=self._experience_session_id, stage="optimization",
+                signature=self._active_experience_signature, records=experiences,
+                direction=self._active_experience_direction,
+            )
+            context = format_experience_context(experiences)
+            if context:
+                self.worker_kwargs["experience_context"] = context
+                if isinstance(runner_kwargs, dict):
+                    runner_kwargs["experience_context"] = context
+                self.logger.info("Loaded %d relevant cross-task experiences (%d connected graph regions)",
+                                 len(experiences), sum(r.retrieval_match == "substructure" and bool(r.graph_match_evidence) for r in experiences))
         # The strategy was initialized before hardware benchmarking. Update its
         # initial entry so first-round improvement is computed against the real
         # baseline rather than inf (which otherwise renders as nan%).
         initial_entry.metrics.time_ms = initial_kernel_time
 
+        # Historical timing is only a ranking hint. Reverify and remeasure a
+        # strictly matching old implementation before it can replace this
+        # session's freshly generated starting point.
+        historical_seed_id = None
+        historical_seed_time_ms = None
+        if (self.experience_store is not None
+                and math.isfinite(initial_kernel_time)
+                and initial_kernel_time > 0):
+            target_platform = self.worker_kwargs.get("target_platform", "cuda")
+            kernel_backend = self.worker_kwargs.get("kernel_backend", "triton")
+            candidates = self.experience_store.search_measured_implementations(
+                self._active_experience_signature,
+                target_platform, kernel_backend,
+                direction=self._active_experience_direction,
+                hardware=self._active_experience_hardware,
+                limit=2,
+            )
+            # Take the snapshot before adding this run's starting point; it is
+            # not a historical candidate and must not consume the top-k slots.
+            self._record_measured_start(
+                initial_kernel, initial_kernel_time,
+                "Benchmarked verified starting kernel",
+                samples_ms=initial_samples,
+            )
+            current_hash = hashlib.sha256(initial_kernel.encode("utf-8")).hexdigest()
+            best_time = initial_kernel_time
+            for candidate in candidates:
+                event_id = self.experience_store.log_retrieval(
+                    session_id=self._experience_session_id,
+                    stage="optimization_seed",
+                    signature=self._active_experience_signature,
+                    records=[], seeds=[candidate],
+                    direction=self._active_experience_direction,
+                )
+                match_evidence = {
+                    "candidate_match": candidate.candidate_match,
+                    "text_contract_match": candidate.candidate_text_match,
+                    "graph_contract_match": candidate.candidate_graph_match,
+                }
+                if candidate.source_hash == current_hash:
+                    self.experience_store.set_retrieval_outcome(event_id, {
+                        **match_evidence,
+                        "decision": "same_source",
+                        "verified": None,
+                        "adopted": False,
+                        "historical_time_ms": candidate.kernel_time_ms,
+                        "remeasured_time_ms": None,
+                    })
+                    continue
+                candidate_time = None
+                candidate_samples: list[float] = []
+                parent_samples: list[float] = []
+                measured_cases = []
+                from .measurement_policy import compare
+                comparison = compare([], [])
+                trial_error = None
+                try:
+                    verified = self._verify_initial_kernel(
+                        candidate.kernel_code, problem_file, test_code
+                    )
+                    if verified:
+                        pair_fn = getattr(self.benchmarker, "benchmark_pair", None)
+                        if callable(pair_fn):
+                            parent_result, candidate_result = pair_fn(
+                                initial_entry.kernel_code, candidate.kernel_code, problem_file)
+                            from .case_suite import measurement_is_covered, paired_cases
+                            measured_cases = paired_cases(parent_result, candidate_result)
+                            checked = getattr(getattr(self, "verifier", None), "last_case_results", [])
+                            rows = candidate_result.get("case_measurements", [])
+                            covered = (not (rows or checked) or measurement_is_covered(rows, checked))
+                            parent_samples = parent_result.get("samples_ms", [])
+                            candidate_samples = candidate_result.get("samples_ms", []) if covered else []
+                            comparison = candidate_result.get("comparison") or compare([], [])
+                            if not covered:
+                                comparison = {**comparison, "adopt": False, "reason": "verification_coverage_mismatch"}
+                        else:
+                            candidate_samples = self._benchmark_initial_kernel_samples(
+                                candidate.kernel_code, problem_file
+                            )
+                        if candidate_samples:
+                            candidate_time = statistics.median(candidate_samples)
+                except Exception as exc:
+                    verified = False
+                    trial_error = str(exc)
+                    self.logger.warning(
+                        "Historical implementation %s could not be retested: %s",
+                        candidate.id, exc,
+                    )
+                usable = (verified and isinstance(candidate_time, (int, float))
+                          and math.isfinite(candidate_time) and candidate_time > 0)
+                if usable:
+                    self._record_measured_start(
+                        candidate.kernel_code, candidate_time,
+                        "Reverified historical implementation",
+                        parent_ref=candidate.id,
+                        hardware=self._active_experience_hardware,
+                        samples_ms=candidate_samples,
+                        baseline_samples_ms=parent_samples,
+                        comparison=comparison,
+                        case_measurements=measured_cases if callable(pair_fn) else None,
+                    )
+                adopted = bool(usable and comparison.get("adopt") and candidate_time < best_time)
+                decision = (
+                    "trial_error" if trial_error else
+                    "verification_failed" if not verified else
+                    "invalid_benchmark" if not usable else
+                    "adopted" if adopted else
+                    "inconclusive" if comparison.get("status") == "inconclusive" else "not_faster"
+                )
+                self.experience_store.set_retrieval_outcome(event_id, {
+                    "verified": verified,
+                    **match_evidence,
+                    "decision": decision,
+                    "error": trial_error,
+                    "historical_time_ms": candidate.kernel_time_ms,
+                    "remeasured_time_ms": candidate_time if usable else None,
+                    "remeasured_samples_ms": candidate_samples,
+                    "adopted": adopted,
+                    "comparison": comparison,
+                    "remeasured_parent_samples_ms": parent_samples,
+                })
+                if adopted:
+                    best_time = candidate_time
+                    historical_seed_id = candidate.id
+                    historical_seed_time_ms = candidate_time
+                    initial_entry = ProgramEntry(
+                        program_id="historical_initial",
+                        kernel_code=candidate.kernel_code,
+                        metrics=ProgramMetrics(time_ms=candidate_time),
+                        problem_id=str(problem_file),
+                    )
+            if historical_seed_id is not None:
+                self.strategy.initialize(initial_entry)
+                self.logger.info(
+                    "Starting from reverified historical implementation %s "
+                    "(%.4f ms vs fresh %.4f ms)",
+                    historical_seed_id, historical_seed_time_ms,
+                    initial_kernel_time,
+                )
+
         best_mcu_profile: dict[str, Any] | None = None
-        best_profile_time = initial_kernel_time
+        best_profile_time = initial_entry.metrics.time_ms
 
         # Round loop
         round_num = 0
-        target_reached = False
-        for round_num in range(1, max_rounds + 1):
+        target_reached = bool(
+            target_improvement_pct is not None
+            and _target_improvement_reached(
+                initial_kernel_time, initial_entry.metrics.time_ms,
+                target_improvement_pct,
+            )
+        )
+        if target_reached:
+            self.logger.info("Target improvement reached by historical starting point")
+        for round_num in range(1, max_rounds + 1) if not target_reached else ():
             self.logger.info("")
             self.logger.info(f"{'=' * 20} ROUND {round_num}/{max_rounds} {'=' * 20}")
 
@@ -634,6 +846,16 @@ class OptimizationManager:
                 speedup_pt = pytorch_baseline / best.metrics.time_ms
                 self.logger.info(f"Speedup vs PyTorch eager: {speedup_pt:.2f}x")
 
+        if self.experience_store is not None:
+            retrieval_id = getattr(self, "_experience_retrieval_id", None)
+            if retrieval_id:
+                self.experience_store.set_retrieval_outcome(retrieval_id, {
+                    "success": best is not None and best.metrics.time_ms != float("inf"),
+                    "best_time_ms": best.metrics.time_ms if best else None,
+                    "initial_kernel_time_ms": initial_kernel_time,
+                    "rounds": round_num,
+                })
+
         return {
             "success": best is not None and best.metrics.time_ms != float("inf"),
             "kernel_code": best.kernel_code if best else None,
@@ -642,6 +864,8 @@ class OptimizationManager:
             "pytorch_baseline_ms": pytorch_baseline,
             "pytorch_compile_ms": pytorch_compile_time,
             "initial_kernel_time_ms": initial_kernel_time,
+            "historical_seed_id": historical_seed_id,
+            "historical_seed_time_ms": historical_seed_time_ms,
             "target_reached": target_reached,
             "target_improvement_pct": target_improvement_pct,
             "termination_reason": (
@@ -670,7 +894,9 @@ class OptimizationManager:
         kernel_backend = self.worker_kwargs.get("kernel_backend", "triton")
         for result in results:
             attempt = result.get("attempt") or {}
-            kernel_code = result.get("kernel_code")
+            # result.kernel_code is best-so-far and may have been rolled back.
+            # Attempt metrics must be attached to the measured candidate only.
+            kernel_code = result.get("attempt_kernel_code")
             if not kernel_code or not attempt:
                 continue
             verified = bool(attempt.get("passed_verification"))
@@ -678,21 +904,27 @@ class OptimizationManager:
             measured_time = attempt.get("time_after_ms")
             if verified and (
                 not isinstance(measured_time, (int, float))
+                or isinstance(measured_time, bool)
                 or not math.isfinite(measured_time)
                 or measured_time <= 0
             ):
                 self.logger.warning(
-                    "Skipping verified experience without a valid benchmark"
+                    "Recording verified experience without a valid benchmark"
                 )
-                continue
+                measured_time = None
             outcome = (
                 "improved"
                 if improved and verified
-                else "success"
-                if verified
+                else "regressed" if verified and measured_time is not None
+                else "success" if verified
                 else "failed"
             )
             reflexion = result.get("reflexion") or {}
+            if (reflexion.get("round_num") is not None
+                    and reflexion["round_num"] != attempt.get("round_num")):
+                self.logger.warning("Ignoring reflection from a different attempt round")
+                reflexion = {}
+            claims = normalize_claims(reflexion.get("claims"))
             lessons = reflexion.get("lessons") or []
             lesson = "; ".join(str(item) for item in lessons)
             if not lesson:
@@ -702,28 +934,99 @@ class OptimizationManager:
                 "memory_sol_pct": attempt.get("memory_sol_pct", 0.0),
                 "combined_sol_pct": attempt.get("combined_sol_pct", 0.0),
             }
-            self.experience_store.add(
+            self.experience_store.add_online(
                 ExperienceRecord(
                     signature=self._active_experience_signature,
+                    direction=getattr(self, "_active_experience_direction", "unknown"),
                     platform=platform,
                     kernel_backend=kernel_backend,
                     outcome=outcome,
                     kernel_code=kernel_code,
                     verified=verified,
+                    case_results=tuple(attempt.get("case_results") or ()),
+                    case_measurements=tuple(attempt.get("case_measurements") or ()),
+                    comparison=attempt.get("comparison") or {},
                     action=str(attempt.get("recommended_fix") or ""),
                     bottleneck=str(attempt.get("bottleneck_category") or ""),
                     lesson=lesson,
+                    lesson_claims=tuple(claims),
+                    incumbent_time_ms=attempt.get("time_before_ms"),
+                    selected_by_worker=improved,
                     error_message=str(attempt.get("error_message") or ""),
-                    baseline_time_ms=attempt.get("time_before_ms"),
+                    baseline_time_ms=(
+                        attempt.get("evidence_baseline_ms")
+                        or attempt.get("time_before_ms")
+                    ),
                     kernel_time_ms=measured_time,
+                    kernel_samples_ms=tuple(attempt.get("kernel_samples_ms") or ()),
+                    baseline_samples_ms=tuple(
+                        attempt.get("baseline_samples_ms") or ()
+                    ),
                     improvement_pct=attempt.get("improvement_pct"),
                     profiler_metrics=metrics,
+                    config_changes={
+                        str(key): str(value)
+                        for key, value in (attempt.get("config_changes") or {}).items()
+                    },
+                    parent_ref=str(result.get("parent_id") or ""),
+                    hardware=str(result.get("hardware") or ""),
                     environment={
                         **collect_environment(),
                         "model": result.get("openai_model", self.openai_model),
+                        "gpu_architecture": result.get("architecture") or "",
+                        "reference_source_kind": "optimization_problem_file",
+                        "raw_reflection": reflexion,
+                        "reference_source_digest": getattr(
+                            self, "_active_reference_source_digest", ""
+                        ),
                     },
-                )
+                ),
+                session_id=getattr(self, "_experience_session_id", uuid4().hex),
+                test_suite_hash=getattr(self, "_experience_test_hash", ""),
             )
+
+    def _record_measured_start(
+        self, kernel_code: str, time_ms: float, action: str,
+        *, parent_ref: str = "", hardware: str = "",
+        samples_ms: list[float] | None = None,
+        comparison: dict[str, Any] | None = None,
+        baseline_samples_ms: list[float] | None = None,
+        case_measurements: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Retain a valid starting point even if later rounds never improve it."""
+        if self.experience_store is None:
+            return
+        self.experience_store.add_online(
+            ExperienceRecord(
+                signature=self._active_experience_signature,
+                direction=self._active_experience_direction,
+                platform=self.worker_kwargs.get("target_platform", "cuda"),
+                kernel_backend=self.worker_kwargs.get("kernel_backend", "triton"),
+                outcome="success", verified=True, kernel_code=kernel_code,
+                action=action, kernel_time_ms=time_ms,
+                kernel_samples_ms=tuple(samples_ms or ()),
+                baseline_samples_ms=tuple(baseline_samples_ms or ()),
+                comparison=comparison or {},
+                case_results=tuple(getattr(getattr(self, "verifier", None), "last_case_results", ()) or ()),
+                case_measurements=tuple(case_measurements if case_measurements is not None else
+                    (getattr(getattr(self, "benchmarker", None), "last_case_measurements", ()) or ())),
+                parent_ref=parent_ref, hardware=(
+                    hardware or getattr(self, "_active_experience_hardware", "")
+                ),
+                environment={
+                    **collect_environment(), "model": self.openai_model,
+                    "reference_source_kind": "optimization_problem_file",
+                    "hardware_source": getattr(
+                        self, "_active_experience_hardware_source", "unknown"
+                    ),
+                    "reference_source_digest": getattr(
+                        self, "_active_reference_source_digest", ""
+                    ),
+                },
+            ),
+            session_id=self._experience_session_id,
+            test_suite_hash=self._experience_test_hash,
+        )
 
     # ------------------------------------------------------------------
     # Thin delegates to platform components
@@ -747,6 +1050,25 @@ class OptimizationManager:
     ) -> float:
         """Benchmark the initial kernel before optimization begins."""
         return self.benchmarker.benchmark_kernel(initial_kernel, problem_file)
+
+    def _benchmark_initial_kernel_samples(
+        self, initial_kernel: str, problem_file: Path
+    ) -> list[float]:
+        """Use a backend's repeated windows where available, else legacy timing."""
+        benchmarker = getattr(self, "benchmarker", None)
+        sample_fn = getattr(benchmarker, "benchmark_kernel_samples", None)
+        raw = (sample_fn(initial_kernel, problem_file)
+               if callable(sample_fn)
+               else [self._benchmark_initial_kernel(initial_kernel, problem_file)])
+        from .case_suite import measurement_is_covered, valid_samples
+        rows = getattr(benchmarker, "last_case_measurements", [])
+        results = getattr(getattr(self, "verifier", None), "last_case_results", [])
+        if (rows or results) and not measurement_is_covered(rows, results):
+            self.logger.warning("Ignoring timing: measured cases do not match the verified full suite")
+            return []
+        if not valid_samples(raw):
+            return []
+        return [float(value) for value in raw]
 
     def _benchmark_pytorch_compile(self, problem_file: Path) -> float:
         """Benchmark the compiler-optimized reference."""

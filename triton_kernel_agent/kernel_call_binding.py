@@ -1,6 +1,7 @@
 """Bind problem inputs and model state to a generated kernel signature."""
 from __future__ import annotations
 import inspect
+import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -48,6 +49,32 @@ def collect_model_values(model: Any | None) -> tuple[dict[str, Any], list[Any]]:
     return values, ordered_parameters
 
 
+def _resolve_state_alias(name: str, values: dict[str, Any]) -> Any | None:
+    """Match generated ``module_weight`` names to qualified model state."""
+    stem, separator, leaf = name.rpartition("_")
+    if not separator or leaf not in {"weight", "bias"}:
+        return None
+    qualified = [
+        (key, value) for key, value in values.items()
+        if key.endswith(f".{leaf}")
+    ]
+    exact = [
+        value for key, value in qualified
+        if key.rsplit(".", 1)[0].replace(".", "_") == stem
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise KernelCallBindingError(f"Ambiguous model state for {name}")
+    numbered = [
+        value for key, value in qualified
+        if re.fullmatch(re.escape(stem) + r"\d+", key.rsplit(".", 1)[0])
+    ]
+    if len(numbered) > 1:
+        raise KernelCallBindingError(f"Ambiguous model state for {name}")
+    return numbered[0] if numbered else None
+
+
 def bind_kernel_call(
     kernel_function: Callable[..., Any], model: Any | None, inputs: Sequence[Any]
 ) -> Callable[[], Any]:
@@ -72,6 +99,8 @@ def bind_kernel_call(
         source_name = _ALIASES.get(parameter.name, parameter.name)
         if source_name in model_values:
             value = model_values[source_name]
+        elif (state_value := _resolve_state_alias(source_name, model_values)) is not None:
+            value = state_value
         elif input_index < len(inputs):
             value = inputs[input_index]
             input_index += 1

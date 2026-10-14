@@ -18,6 +18,9 @@ limitations under the License.
 import importlib
 import sys
 import torch
+{% if target_device == 'musa' %}
+import torch_musa
+{% endif %}
 import inspect
 sys.path.insert(0, str({{ kernel_file_parent }}))
 sys.path.insert(0, str({{ problem_file_parent }}))
@@ -62,21 +65,12 @@ required_dtype = None
 if required_dtype is not None and not isinstance(required_dtype, torch.dtype):
     required_dtype = None
 
-# Prepare inputs: move to CUDA and convert dtype if needed
-# IMPORTANT: Only convert floating-point tensors; preserve integer tensors (e.g., class labels)
-cuda_inputs = []
-for inp in inputs:
-    if isinstance(inp, torch.Tensor):
-        # Move to CUDA if not already
-        if not inp.is_cuda:
-            inp = inp.cuda()
-        # Convert dtype if required, but ONLY for floating-point tensors
-        # Preserve integer/bool tensors (e.g., targets for classification)
-        if required_dtype is not None and inp.is_floating_point() and inp.dtype != required_dtype:
-            inp = inp.to(required_dtype)
-        cuda_inputs.append(inp)
-    else:
-        cuda_inputs.append(inp)
+# Use the verification/measurement mover: .to() can compact sliced tensors.
+# The reference input dtype is authoritative, not source-code keyword guesses.
+from kernel_case_suite import move
+if not isinstance(inputs, (list, tuple)):
+    inputs = [inputs]
+cuda_inputs = move(inputs, {{ target_device | tojson }})
 
 {% if model_extraction %}
 from kernel_call_binding import bind_kernel_call
@@ -87,7 +81,7 @@ if has_model:
         model = Model(*init_inputs) if init_inputs else Model()
     except TypeError:
         model = Model()
-    model = model.cuda()
+    model = model{% if target_device == 'musa' %}.to("musa"){% else %}.cuda(){% endif %}
     if required_dtype is not None:
         model = model.to(required_dtype)
 
@@ -98,29 +92,20 @@ def run_kernel():
     return _bound_kernel_call()
 
 
-# Warmup phase: Complete autotuning and JIT compilation BEFORE NCU profiling
-# NCU uses --launch-skip to skip these warmup launches
-# This ensures NCU only profiles the optimized kernel, not autotuning overhead
-WARMUP_ITERATIONS = 3
-for _ in range(WARMUP_ITERATIONS):
-    _ = run_kernel()
-torch.cuda.synchronize()
-
-# Main execution: This is what NCU will profile (after skipping warmup launches)
 {% else %}
 def run_kernel():
     """Helper to run the kernel with appropriate arguments."""
     return kernel_function(*cuda_inputs)
+{% endif %}
 
 
 # Warmup phase: Complete autotuning and JIT compilation BEFORE NCU profiling
-WARMUP_ITERATIONS = 3
+WARMUP_ITERATIONS = {{ warmup_iterations }}
 for _ in range(WARMUP_ITERATIONS):
     _ = run_kernel()
-torch.cuda.synchronize()
+torch.{{ target_device }}.synchronize()
 
 # Main execution: This is what NCU will profile (after skipping warmup launches)
-{% endif %}
 output = run_kernel()
 
 print("Kernel executed successfully, output shape: " + str(output.shape if hasattr(output, 'shape') else type(output)))

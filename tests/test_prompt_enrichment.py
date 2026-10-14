@@ -1,5 +1,7 @@
 from unittest.mock import Mock
 
+import pytest
+
 from triton_kernel_agent.agent import (
     TritonKernelAgent,
     validate_generated_test_input_contract,
@@ -46,6 +48,27 @@ def test_generated_test_reuses_exact_problem_input_factories():
         _RMSNORM_PROBLEM + "\ninputs = get_inputs()\ninit_inputs = get_init_inputs()\n"
     )
     validate_generated_test_input_contract(_RMSNORM_PROBLEM, test_code)
+
+
+def test_generated_test_checks_final_describe2_input_factory():
+    earlier = _RMSNORM_PROBLEM.replace("M, N = 1024, 4096", "M, N = 1, 4096")
+    description = (
+        "## Describe2 (original suggestion)\n" + earlier
+        + "\nCurrent runtime context.\n"
+        + "## Describe2 (final reference)\n" + _RMSNORM_PROBLEM
+    )
+    final_test = (
+        _RMSNORM_PROBLEM + "\ninputs = get_inputs()\ninit_inputs = get_init_inputs()\n"
+    )
+    validate_generated_test_input_contract(description, final_test)
+    changed_test = final_test.replace("M, N = 1024, 4096", "M, N = 1, 4096")
+    with pytest.raises(ValueError, match="exact get_inputs"):
+        validate_generated_test_input_contract(description, changed_test)
+    changed_factory = final_test.replace(
+        "torch.randn((M, N)", "torch.randn((1, N)"
+    )
+    with pytest.raises(ValueError, match="exact get_inputs"):
+        validate_generated_test_input_contract(description, changed_factory)
 
 
 def test_generated_test_rejects_changed_factory_workload():

@@ -8,6 +8,16 @@ import json
 import re
 
 from .models import OperatorSignature
+from .graph_identity import trace_reference_graph
+
+
+def declared_execution_direction(source: str) -> str | None:
+    """Read an explicit target; never infer direction from operator text."""
+    match = re.search(
+        r'(?m)^KERNELAGENT_OPTIMIZATION_TARGET\s*=\s*["\'](forward|backward)["\']',
+        source,
+    )
+    return match.group(1) if match else None
 
 _DTYPE_RE = re.compile(
     r"(?:torch\.)?(bfloat16|float16|float32|float64|int8|int16|int32|"
@@ -49,8 +59,84 @@ _IGNORED_TOKENS = {
 }
 
 
+def _focused_text(text: str) -> tuple[str, bool]:
+    # Descriptions may include the surrounding model. Prefer the explicit target.
+    target = re.search(
+        r"(?im)^[ \t]*(?:only this (?:block should be generated and optimized|part)"
+        r"|only generate and optimize this block|target operator only):"
+        r"[ \t]*(?:\n[ \t]*)?([^\n]+)$",
+        text,
+    )
+    return (target.group(1), True) if target else (text, False)
+
+
+def _reference_source(text: str) -> str:
+    """Prefer the declared reference Model over surrounding application prose."""
+    match = re.search(r"(?im)^##\s*Describe2\b[^\n]*\n", text)
+    if not match:
+        return text
+    source = re.split(r"(?m)^##\s+", text[match.end():], maxsplit=1)[0].strip()
+    fenced = re.fullmatch(r"```(?:python)?\s*\n([\s\S]*?)\n```", source)
+    return fenced.group(1) if fenced else source
+
+
+def reference_source_from_test(test_code: str) -> str | None:
+    """Extract the reference executed by a verified test, excluding test harness.
+
+    Only top-level definitions needed by Model/input factories are retained.
+    In particular, importing the generated ``kernel`` is neither necessary nor
+    valid when tracing the reference in a separate process.
+    """
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return None
+    definitions: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions[node.name] = node
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                definitions[alias.asname or alias.name.split(".")[0]] = node
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                definitions[alias.asname or alias.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        definitions[name.id] = node
+    if "Model" not in definitions or "get_inputs" not in definitions:
+        return None
+    selected = {"Model", "get_inputs", "get_init_inputs", "get_test_cases",
+                "KERNELAGENT_OPTIMIZATION_TARGET"} & definitions.keys()
+    pending = list(selected)
+    while pending:
+        node = definitions[pending.pop()]
+        for child in ast.walk(node):
+            if (isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                    and child.id in definitions and child.id not in selected):
+                selected.add(child.id)
+                pending.append(child.id)
+    nodes = {id(definitions[name]) for name in selected}
+    retained = [node for node in tree.body if id(node) in nodes]
+    for node in retained:
+        if isinstance(node, ast.ImportFrom) and (
+            node.module == "kernel" or (node.module or "").startswith("kernel.")
+        ):
+            return None
+        if isinstance(node, ast.Import) and any(
+            alias.name == "kernel" or alias.name.startswith("kernel.")
+            for alias in node.names
+        ):
+            return None
+    return ast.unparse(ast.Module(body=retained, type_ignores=[])) + "\n"
+
+
 def _semantic_type(text: str) -> str:
-    lowered = text.lower().replace(" ", "_")
+    focused, _ = _focused_text(text)
+    lowered = focused.lower().replace(" ", "_")
     compact = lowered.replace("_", "")
     if "rsqrt" in compact and ("variance" in compact or "mean(" in compact):
         return "rmsnorm"
@@ -121,6 +207,77 @@ def _parse_problem_ast(text: str) -> ast.AST | None:
     return None
 
 
+def _call_operator(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    name = node.func.attr.lower()
+    if name.startswith("conv"):
+        return "convolution"
+    if name in {"matmul", "mm", "bmm"}:
+        return "matmul"
+    aliases = {
+        "relu": "relu", "softmax": "softmax", "sigmoid": "sigmoid",
+        "gelu": "gelu", "silu": "silu", "layer_norm": "layernorm",
+        "layernorm": "layernorm", "rms_norm": "rmsnorm",
+        "rmsnorm": "rmsnorm", "batch_norm": "batchnorm",
+        "batchnorm": "batchnorm", "max_pool2d": "pooling",
+        "avg_pool2d": "pooling",
+    }
+    return aliases.get(name)
+
+
+def _extract_components(text: str) -> tuple[str, ...]:
+    """Conservative directed two-node dataflow motifs from Python forward code."""
+    tree = _parse_problem_ast(text)
+    if tree is None:
+        return ()
+    forwards = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "forward"
+    ]
+    bodies = [node.body for node in forwards] or [getattr(tree, "body", [])]
+    edges: set[str] = set()
+
+    for body in bodies:
+        producers: dict[str, str] = {}
+
+        def producer(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                return producers.get(node.id)
+            operator = _call_operator(node)
+            if operator:
+                return operator
+            if isinstance(node, ast.BinOp):
+                sources = {source for child in (node.left, node.right)
+                           if (source := producer(child))}
+                return next(iter(sources)) if len(sources) == 1 else None
+            if isinstance(node, ast.UnaryOp):
+                return producer(node.operand)
+            return None
+
+        for statement in body:
+            value = getattr(statement, "value", None)
+            if value is None:
+                continue
+            for call in ast.walk(value):
+                consumer = _call_operator(call)
+                if consumer is None:
+                    continue
+                for argument in (*call.args, *(kw.value for kw in call.keywords)):
+                    source = producer(argument)
+                    if source and source != consumer:
+                        edges.add(f"{source}_{consumer}")
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    if isinstance(target, ast.Name):
+                        source = producer(value)
+                        producers.pop(target.id, None)
+                        if source:
+                            producers[target.id] = source
+    return tuple(sorted(edges))
+
+
 def _extract_shapes_from_text(text: str) -> tuple[tuple[int, ...], ...]:
     """Best-effort shape extraction for prose or structurally invalid Python."""
 
@@ -157,26 +314,35 @@ def _extract_shapes_from_text(text: str) -> tuple[tuple[int, ...], ...]:
     return tuple(sorted(shapes, key=lambda value: (len(value), value))[:12])
 
 
-def build_operator_signature(problem_description: str) -> OperatorSignature:
+def build_operator_signature(
+    problem_description: str, *, trace_graph: bool = False,
+    execution_direction: str | None = None,
+) -> OperatorSignature:
     text = problem_description or ""
-    tree = _parse_problem_ast(text)
+    reference = _reference_source(text)
+    tree = _parse_problem_ast(reference)
     shapes = set(_extract_shapes(tree) if tree is not None else ())
-    shapes.update(_extract_shapes_from_text(text))
+    shapes.update(_extract_shapes_from_text(reference))
     shapes = tuple(sorted(shapes, key=lambda value: (len(value), value))[:12])
 
-    dtypes = tuple(sorted({match.lower() for match in _DTYPE_RE.findall(text)}))
+    dtypes = tuple(sorted({match.lower() for match in _DTYPE_RE.findall(reference)}))
     tokens = tuple(
         sorted(
             {
                 token.lower()
-                for token in _TOKEN_RE.findall(text)
+                for token in _TOKEN_RE.findall(reference)
                 if token.lower() not in _IGNORED_TOKENS
             }
         )[:80]
     )
-    semantic_type = _semantic_type(text)
+    semantic_type = _semantic_type(reference)
+    focused, _ = _focused_text(reference)
+    components = set(_extract_components(focused))
+    components.discard(semantic_type)
+    components = tuple(sorted(components))
     normalized = {
         "semantic_type": semantic_type,
+        "components": components,
         "dtypes": dtypes,
         "shapes": shapes,
         "tokens": tokens,
@@ -184,4 +350,23 @@ def build_operator_signature(problem_description: str) -> OperatorSignature:
     digest = hashlib.sha256(
         json.dumps(normalized, sort_keys=True).encode("utf-8")
     ).hexdigest()[:24]
-    return OperatorSignature(semantic_type, dtypes, shapes, tokens, digest)
+    contract_digest = hashlib.sha256(
+        re.sub(r"\s+", " ", text.strip()).encode("utf-8")
+    ).hexdigest()[:24]
+    if execution_direction not in {None, "forward", "backward", "joint", "unknown"}:
+        raise ValueError("invalid graph execution direction")
+    # Override only the probe's execution target, after extracting Describe2.
+    # Prose/request fingerprints and code-seed contract gates stay unchanged.
+    graph_source = reference
+    if execution_direction in {"forward", "backward", "joint"}:
+        graph_source += f"\nKERNELAGENT_OPTIMIZATION_TARGET = {execution_direction!r}\n"
+    graph = trace_reference_graph(graph_source) if trace_graph and tree is not None else None
+    return OperatorSignature(
+        semantic_type, dtypes, shapes, tokens, digest, components,
+        contract_digest,
+        graph_version=graph["version"] if graph else "",
+        graph_digest=graph["digest"] if graph else "",
+        graph_nodes=tuple(graph["nodes"]) if graph else (),
+        interface=graph["interface"] if graph else {},
+        graph_tensor_specs=graph.get("tensor_specs", {}) if graph else {},
+    )

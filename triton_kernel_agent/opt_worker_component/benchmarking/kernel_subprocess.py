@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -160,20 +161,24 @@ def _benchmark(
     name: str,
     warmup: int = 25,
     rep: int = 100,
-) -> float:
+) -> tuple[float, list[float]]:
     """Benchmark a kernel function using triton.testing.do_bench."""
     try:
-        ms = tt.do_bench(
-            lambda: fn(*inputs, *init_inputs),
-            warmup=warmup,
-            rep=rep,
-            return_mode="mean",
-        )
-        print(f"{name}: {ms:.4f} ms (mean over {rep} runs)")
-        return ms
+        samples = [
+            tt.do_bench(
+                lambda: fn(*inputs, *init_inputs),
+                warmup=warmup,
+                rep=rep,
+                return_mode="mean",
+            )
+            for _ in range(3)
+        ]
+        ms = statistics.median(samples)
+        print(f"{name}: {ms:.4f} ms (median of 3 timing windows)")
+        return ms, samples
     except Exception as exc:
         print(f"❌ {name}: Benchmark failed: {exc}")
-        return float("inf")
+        return float("inf"), []
 
 
 def _parse_args() -> argparse.Namespace:
@@ -418,6 +423,7 @@ def _save_results(results: dict[str, Any], path: Path) -> None:
 
 def main():
     args = _parse_args()
+    torch.manual_seed(0)
 
     device = torch.device(args.device)
     dtype = {
@@ -448,6 +454,37 @@ def main():
         print(f"Warmup: {args.warmup}, Repeat: {args.repeat}")
         print()
 
+    # Explicit suites use the same canonical binding, direction and CPU factories
+    # as verification; never silently benchmark only their primary case.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from triton_kernel_agent.case_suite import benchmark_cases
+    explicit_problem = import_module(args.problem, "case_benchmark_problem")
+    if (hasattr(explicit_problem, "get_test_cases") or
+            getattr(explicit_problem, "KERNELAGENT_OPTIMIZATION_TARGET", "forward") == "backward"):
+        explicit_kernel = import_module(args.kernel, "case_benchmark_kernel").kernel_function
+        def measure(invoke):
+            for _ in range(args.warmup):
+                invoke()
+            torch.cuda.synchronize()
+            samples = []
+            for _ in range(3):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(args.repeat):
+                    invoke()
+                end.record()
+                torch.cuda.synchronize()
+                samples.append(start.elapsed_time(end) / args.repeat)
+            return samples
+        target = getattr(explicit_problem, "KERNELAGENT_OPTIMIZATION_TARGET", "forward")
+        payload = benchmark_cases(explicit_problem, explicit_kernel, device, target, measure)
+        kernels = {args.kernel.stem: payload}
+        if args.baseline:
+            kernels["pytorch_reference"] = benchmark_cases(explicit_problem, None, device, target, measure)
+        if args.json:
+            _save_results({"kernels": kernels}, args.json)
+        return
+
     # Load problem and prepare inputs
     try:
         Model, inputs, init_inputs, baseline_model = _load_problem(args, device, dtype)
@@ -470,11 +507,12 @@ def main():
     if baseline_model is not None:
         if not args.quiet:
             print("1. PyTorch Reference")
-        baseline_time = _benchmark(
+        baseline_time, baseline_samples = _benchmark(
             baseline_model, inputs, [], "PyTorch", args.warmup, args.repeat
         )
         results["kernels"]["pytorch_reference"] = {
             "time_ms": baseline_time,
+            "samples_ms": baseline_samples,
             "speedup": 1.0,
         }
         if not args.quiet:
@@ -511,10 +549,13 @@ def main():
         sys.exit(1)
 
     # Benchmark kernel
-    kernel_time = _benchmark(
+    kernel_time, kernel_samples = _benchmark(
         kernel_fn, inputs, kernel_init_args, kernel_name, args.warmup, args.repeat
     )
-    results["kernels"][kernel_name] = {"time_ms": kernel_time, "path": str(args.kernel)}
+    results["kernels"][kernel_name] = {
+        "time_ms": kernel_time, "samples_ms": kernel_samples,
+        "path": str(args.kernel),
+    }
 
     # Calculate speedup
     if baseline_time is not None and kernel_time != float("inf"):

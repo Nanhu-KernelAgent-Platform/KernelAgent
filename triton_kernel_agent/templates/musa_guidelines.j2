@@ -1,8 +1,23 @@
 Generate a native MUSA extension bundle.
 
 - Keep computation in kernel.mu; do not replace it with PyTorch eager operations.
+- Never monkeypatch torch/torch_musa, Tensor methods, numerical checks, autograd,
+  builtins or process exits to affect tests. Input-transfer/test setup failures
+  must be repaired in the test, never through global side effects in kernel.py.
 - kernel.py must expose kernel_function and load the extension built by setup.py.
 - setup.py must use torch_musa.utils.musa_extension.MUSAExtension and BuildExtension.
 - binding.cpp contains only the PyTorch binding and launch dispatch glue.
 - Keep all tensors and synchronization on torch.musa.
 - Return every required source file using the exact FILE block format.
+- kernel.py is implementation-only: do not echo the reference Model, torch.nn
+  classes, get_inputs/get_init_inputs/get_test_cases, tests or a benchmark main.
+  A torch.autograd.Function wrapper is allowed; its computation must dispatch
+  to native forward/backward kernels, never reference PyTorch arithmetic.
+- Training backward must multiply the local derivative by the supplied upstream
+  gradient, including nonuniform/noncontiguous gradients. Preserve input strides.
+- Prefer raw-pointer native launchers in kernel.mu and Tensor binding/dispatch
+  in binding.cpp. Match declarations and definitions, including linkage and
+  namespaces. If native code uses Tensor types, include their defining headers;
+  do not invent MUSA include paths. Use the available platform guidance.
+- Emit literal FILE: filename headers outside and immediately before each fence;
+  include all four files on every repair, even when only one file changes.

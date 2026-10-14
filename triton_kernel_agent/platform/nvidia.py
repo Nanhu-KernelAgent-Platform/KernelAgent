@@ -78,6 +78,7 @@ class NvidiaVerifier(KernelVerifier):
             problem_description=problem_file.read_text(),
             max_refine_attempts=0,
         )
+        self.last_case_results = getattr(worker, "last_case_results", [])
 
         if not success:
             self.logger.error(
@@ -140,12 +141,29 @@ class NvidiaBenchmarker(KernelBenchmarker):
         kernel_file.write_text(kernel_code, encoding="utf-8")
 
         result = benchmarker.benchmark_kernel(kernel_file, problem_file)
+        self.last_case_measurements = result.get("case_measurements", [])
+        self.last_samples_ms = result.get("samples_ms", [])
         kernel_time = result.get("time_ms", float("inf"))
 
         if kernel_time != float("inf"):
             self.logger.info(f"Initial kernel time: {kernel_time:.4f}ms")
 
         return kernel_time
+
+    def benchmark_kernel_samples(self, kernel_code: str, problem_file: Path) -> list[float]:
+        self.benchmark_kernel(kernel_code, problem_file)
+        return self.last_samples_ms
+
+    def benchmark_pair(self, parent, candidate, problem_file):
+        paths = []
+        for role, source in (("parent", parent), ("candidate", candidate)):
+            path = self.log_dir / "paired_artifacts" / role / "kernel.py"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8")
+            paths.append(path)
+        before, after = self._get_benchmarker().benchmark_pair(*paths, problem_file)
+        self.last_case_measurements = after.get("case_measurements", [])
+        return before, after
 
     def benchmark_reference(
         self,
@@ -431,7 +449,10 @@ def _nvidia_worker_process(
                 "openai_model": openai_model,
                 "ptx_hash": metrics.get("best_ptx_hash"),
                 "attempt": attempt_data,
+                "attempt_kernel_code": metrics.get("last_attempt_kernel_code"),
                 "reflexion": reflexion_data,
+                "hardware": metrics.get("hardware", ""),
+                "architecture": metrics.get("architecture", ""),
             }
         )
 

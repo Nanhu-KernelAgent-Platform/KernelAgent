@@ -15,6 +15,7 @@
 """Main Triton Kernel Generation Agent."""
 
 import ast
+import hashlib
 import os
 import json
 import re
@@ -25,7 +26,10 @@ import logging
 from dotenv import load_dotenv
 
 from .manager import WorkerManager
+from .experience.generation import generation_memory
 from .prompt_manager import PromptManager
+from .test_validation import validate_test_autograd, validate_test_layout
+from .experience.signature import declared_execution_direction as _declared_execution_direction
 from utils.providers import BaseProvider, get_model_provider
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
@@ -38,20 +42,54 @@ from triton_kernel_agent.experience import (
     ExperienceRecord,
     SQLiteExperienceStore,
     build_operator_signature,
+    reference_source_from_test,
     collect_environment,
-    format_experience_context,
     format_verified_seed_context,
 )
 
 
 def _parse_reference_problem(problem_description: str):
-    """Parse plain problem source or the Describe2 section of a combined prompt."""
-    heading = re.search(r"(?m)^## Describe2[^\n]*\n", problem_description)
-    source = problem_description[heading.end() :] if heading else problem_description
+    """Parse the final Describe2 produced for this request, if present."""
+    headings = list(re.finditer(r"(?m)^## Describe2[^\n]*\n", problem_description))
+    source = problem_description[headings[-1].end():] if headings else problem_description
+    if headings:
+        source = re.split(r"(?m)^##\s+", source, maxsplit=1)[0].strip()
+        fenced = re.fullmatch(r"```(?:python)?\s*\n([\s\S]*?)\n```", source)
+        if fenced:
+            source = fenced.group(1)
     try:
         return ast.parse(source)
     except SyntaxError:
         return None
+
+
+def _input_factory_contract(tree: ast.Module, name: str) -> dict[str, str]:
+
+    """Capture a factory and its top-level helpers/constants, not just its body."""
+    definitions: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for child in ast.walk(target):
+                    if isinstance(child, ast.Name):
+                        definitions[child.id] = node
+    if name not in definitions:
+        return {}
+    selected = {name}
+    pending = [name]
+    while pending:
+        for child in ast.walk(definitions[pending.pop()]):
+            if (isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                    and child.id in definitions and child.id not in selected):
+                selected.add(child.id)
+                pending.append(child.id)
+    return {
+        item: ast.dump(definitions[item], include_attributes=False)
+        for item in selected
+    }
 
 
 def validate_generated_test_input_contract(
@@ -90,9 +128,8 @@ def validate_generated_test_input_contract(
         test_node = test_functions.get(name)
         if test_node is None:
             errors.append(f"{name}() definition")
-        elif ast.dump(test_node, include_attributes=False) != ast.dump(
-            reference_node, include_attributes=False
-        ):
+        elif (_input_factory_contract(test_tree, name)
+              != _input_factory_contract(reference_tree, name)):
             errors.append(f"exact {name}() definition")
         if name not in calls:
             errors.append(f"{name}() call")
@@ -325,140 +362,84 @@ class TritonKernelAgent:
             raise RuntimeError(
                 "Unable to generate test code: no LLM provider available and mock fallback disabled"
             )
-        # Use LLM provider if available
-        if self.provider:
-            try:
-                self.logger.info(f"Generating test code using {self.model_name}")
+        try:
+            self.logger.info(f"Generating test code using {self.model_name}")
 
-                # Create prompt for test generation using template
-                prompt = self.prompt_manager.render_test_generation_prompt(
-                    problem_description=problem_description,
-                    provided_test_code=provided_test_code,
+            # Create prompt for test generation using template
+            prompt = self.prompt_manager.render_test_generation_prompt(
+                problem_description=problem_description,
+                provided_test_code=provided_test_code,
+            )
+
+            # Call the LLM, with one focused repair attempt if it changes or skips
+            # the shared benchmark input factories.
+            messages = [{"role": "user", "content": prompt}]
+            for attempt in range(2):
+                response_text = self._call_llm(messages, max_tokens=24000)
+                self.logger.info("Raw test generation response:\n%s", response_text)
+                test_code = self._extract_code_from_response(response_text)
+                if not test_code:
+                    contract_error = ValueError(
+                        "No valid code found in LLM response"
+                    )
+                else:
+                    try:
+                        validate_test_autograd(test_code)
+                        if getattr(getattr(self, "_platform_config", None), "name", None) == "musa":
+                            validate_test_layout(test_code)
+                        validate_generated_test_input_contract(
+                            problem_description, test_code
+                        )
+                    except ValueError as exc:
+                        contract_error = exc
+                    else:
+                        self.logger.info(
+                            f"Successfully generated test code using {self.model_name}"
+                        )
+                        return test_code
+                if attempt == 1:
+                    raise contract_error
+                self.logger.warning(
+                    "Generated test failed validity/contract checks; retrying once: %s",
+                    contract_error,
+                )
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": response_text},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Repair the test. " + str(contract_error) + ". "
+                                "Copy get_inputs() and get_init_inputs() exactly from "
+                                "Describe2 and call both factories. Return only the "
+                                "complete fenced Python test. Preserve the reference "
+                                "semantics and all cases/tolerances. For backward, "
+                                "recompute the reference with grad enabled and independent "
+                                "leaf inputs; do not differentiate a no_grad result."
+                            ),
+                        },
+                    ]
                 )
 
-                # Call the LLM, with one focused repair attempt if it changes or skips
-                # the shared benchmark input factories.
-                messages = [{"role": "user", "content": prompt}]
-                for attempt in range(2):
-                    response_text = self._call_llm(messages, max_tokens=24000)
-                    self.logger.info("Raw test generation response:\n%s", response_text)
-                    test_code = self._extract_code_from_response(response_text)
-                    if not test_code:
-                        contract_error = ValueError(
-                            "No valid code found in LLM response"
-                        )
-                    else:
-                        try:
-                            validate_generated_test_input_contract(
-                                problem_description, test_code
-                            )
-                        except ValueError as exc:
-                            contract_error = exc
-                        else:
-                            self.logger.info(
-                                f"Successfully generated test code using {self.model_name}"
-                            )
-                            return test_code
-                    if attempt == 1:
-                        raise contract_error
-                    self.logger.warning(
-                        "Generated test violated the input contract; retrying once: %s",
-                        contract_error,
-                    )
-                    messages.extend(
-                        [
-                            {"role": "assistant", "content": response_text},
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Repair the test. " + str(contract_error) + ". "
-                                    "Copy get_inputs() and get_init_inputs() exactly from "
-                                    "Describe2 and call both factories. Return only the "
-                                    "complete fenced Python test."
-                                ),
-                            },
-                        ]
-                    )
+        except Exception as e:
+            self.logger.error(f"Error generating test with LLM API: {e}")
+            raise
 
-            except Exception as e:
-                self.logger.error(f"Error generating test with LLM API: {e}")
-                raise
 
-        # Mock test generation (fallback)
-        self.logger.info("Generating test code (mock implementation)")
-
-        # If provided test code exists, create a basic wrapper
-        if provided_test_code:
-            test_code = '''"""
-Test for kernel implementation (adapted from provided test).
-"""
-import torch
-
-def test_kernel():
-    """Test the kernel implementation."""
-    from kernel import kernel_function
-
-    # Adapted from provided test code
-    try:
-        # Create test data (standardized format)
-        test_input = torch.randn(1024, device='cuda')
-
-        # Call kernel_function as a normal Python function
-        result = kernel_function(test_input)
-
-        # Basic validation
-        if result is not None:
-            print("Test passed!")
-            return True
-        else:
-            print("Test failed: No result returned")
-            return False
-    except Exception as e:
-        print(f"Test failed: {e}")
-        return False
-
-if __name__ == "__main__":
-    import sys
-    success = test_kernel()
-    sys.exit(0 if success else 1)
-'''
-        else:
-            test_code = '''"""
-Test for kernel implementation.
-"""
-import torch
-
-def test_kernel():
-    """Test the kernel implementation."""
-    from kernel import kernel_function
-
-    # Mock test - replace with actual test logic
-    try:
-        # Create test data
-        test_input = torch.randn(1024, device='cuda')
-
-        # Call kernel_function as a normal Python function
-        # (kernel launch logic is handled inside kernel.py)
-        result = kernel_function(test_input)
-
-        print("Test passed!")
-        return True
-    except Exception as e:
-        print(f"Test failed: {e}")
-        return False
-
-if __name__ == "__main__":
-    import sys
-    success = test_kernel()
-    sys.exit(0 if success else 1)
-'''
-        return test_code
+    def _finish_text_retrievals(self, outcome: dict[str, Any]) -> None:
+        """Child text-channel events describe the same joint generation result."""
+        for event_id in getattr(self, "_last_experience_text_retrieval_ids", []):
+            self.experience_store.set_retrieval_outcome(event_id, {
+                **outcome, "parent_generation_event_id": self._last_experience_retrieval_id,
+                "parent_generation_direction": "joint", "text_only": True,
+            })
 
     def _generate_kernel_seeds(
         self,
         problem_description: str,
         test_code: str,
         num_seeds: int | None = None,
+        execution_direction: str = "unknown",
         response_log_dir: Path | None = None,
     ) -> list[str | KernelBundle]:
         """
@@ -489,21 +470,17 @@ if __name__ == "__main__":
                     no_cusolver=self.no_cusolver,
                 )
                 if self.experience_store is not None:
-                    signature = build_operator_signature(problem_description)
-                    experiences = self.experience_store.search(
-                        signature,
-                        platform=self._platform_config.name,
-                        kernel_backend=self._kernel_backend.name,
-                        limit=3,
+                    memory = generation_memory(
+                        self.experience_store, problem_description,
+                        direction=execution_direction,
+                        platform=self._platform_config.name, backend=self._kernel_backend.name,
+                        session_id=response_log_dir.name if response_log_dir else "generation",
+                        logger=self.logger,
                     )
-                    experience_context = format_experience_context(experiences)
-                    verified_seeds = self.experience_store.search_verified_seeds(
-                        signature,
-                        platform=self._platform_config.name,
-                        kernel_backend=self._kernel_backend.name,
-                        limit=2,
-                    )
-                    seed_context = format_verified_seed_context(verified_seeds)
+                    self._last_experience_retrieval_id = memory.root_event
+                    self._last_experience_text_retrieval_ids = memory.text_events
+                    experience_context = memory.context
+                    seed_context = format_verified_seed_context(memory.seeds)
                     if experience_context:
                         prompt = (
                             f"{prompt}\n\n{experience_context}\n\n"
@@ -511,8 +488,7 @@ if __name__ == "__main__":
                             "contract. Follow the original output format exactly."
                         )
                         self.logger.info(
-                            "Added %d relevant cross-task experiences to generation prompt",
-                            len(experiences),
+                            "Added direction-scoped cross-task experience to generation prompt",
                         )
                     if seed_context:
                         prompt = (
@@ -522,7 +498,7 @@ if __name__ == "__main__":
                         )
                         self.logger.info(
                             "Added %d verified implementation seeds",
-                            len(verified_seeds),
+                            len(memory.seeds),
                         )
 
                 kernels = []
@@ -704,6 +680,7 @@ def kernel_function(*args, **kwargs):
         problem_description: str,
         test_code: str | None = None,
         generate_default_test: bool = True,
+        execution_direction: str | None = None,
     ) -> dict[str, Any]:
         """
         Generate an optimized Triton kernel for the given problem.
@@ -715,6 +692,8 @@ def kernel_function(*args, **kwargs):
                       1. Import the kernel function: from kernel import kernel_function
                       2. Test the kernel and return True/False
                       3. Exit with code 0 on success, 1 on failure
+            execution_direction: Trusted forward, backward, or joint target.
+                      Without it, only an explicit marker determines direction.
             generate_default_test: If True (default), auto-generate a primary
                       test using the LLM. The generated test runs before any
                       provided ``test_code``.
@@ -724,6 +703,8 @@ def kernel_function(*args, **kwargs):
         """
         self.logger.info("=" * 60)
         self.logger.info("Starting kernel generation")
+        self._last_experience_retrieval_id = None
+        self._last_experience_text_retrieval_ids = []
         self.logger.info(f"Problem: {problem_description[:100]}...")
 
         # Normalize test_code to list[str]
@@ -745,6 +726,34 @@ def kernel_function(*args, **kwargs):
         import time
 
         # Add microseconds to ensure unique directory names
+        if execution_direction is not None and execution_direction not in {
+            "forward", "backward", "joint"
+        }:
+            raise ValueError("execution_direction must be forward, backward, or joint")
+        declared = next(
+            (value for source in (*test_code_list, problem_description)
+             if (value := _declared_execution_direction(source))),
+            None,
+        )
+        direction = execution_direction or declared or "unknown"
+        from .case_suite import suite_test
+        reference_tree = _parse_reference_problem(problem_description)
+        companion = None
+        if reference_tree is not None:
+            companion = suite_test(ast.unparse(reference_tree), direction, self._platform_config.name)
+            if companion:
+                test_code_list.append(companion)
+                self._has_multiple_tests = True
+                self.logger.info("Added deterministic verification of all explicit input cases")
+        direction_source = (
+            "caller" if execution_direction else "explicit_marker" if declared
+            else "unknown"
+        )
+        if execution_direction and declared and execution_direction != declared:
+            self.logger.warning(
+                "Ignoring conflicting test/request direction %s; caller specified %s",
+                declared, execution_direction,
+            )
         timestamp = (
             datetime.now().strftime("%Y%m%d_%H%M%S")
             + f"_{int(time.time() * 1000000) % 1000000}"
@@ -763,6 +772,7 @@ def kernel_function(*args, **kwargs):
             problem_description,
             format_test_code_for_llm(test_code_list),
             response_log_dir=session_dir,
+            execution_direction=direction,
         )
 
         # Save seeds
@@ -808,22 +818,64 @@ def kernel_function(*args, **kwargs):
                     if isinstance(payload, dict)
                     else payload
                 )
-                self.experience_store.add(
+                reference_source = reference_source_from_test(test_code_list[0])
+                if reference_tree is not None and companion:
+                    # Companion verified the actual reference, including factories
+                    # that an LLM's primary test may legitimately omit.
+                    reference_source = ast.unparse(reference_tree)
+                if reference_source is None:
+                    self.logger.warning(
+                        "Verified test has no extractable reference Model; "
+                        "recording experience without a graph identity"
+                    )
+                experience_source = reference_source or problem_description
+                if reference_source and direction in {"backward", "joint"}:
+                    experience_source = reference_source + f"\nKERNELAGENT_OPTIMIZATION_TARGET = {direction!r}\n"
+                request_signature = build_operator_signature(problem_description)
+                signature = build_operator_signature(
+                    experience_source, trace_graph=reference_source is not None,
+                )
+                self.experience_store.add_online(
                     ExperienceRecord(
-                        signature=build_operator_signature(problem_description),
+                        signature=signature,
+                        direction=direction,
                         platform=self._platform_config.name,
                         kernel_backend=self._kernel_backend.name,
                         outcome="generated",
                         kernel_code=stored_code,
                         verified=True,
+                        case_results=tuple(result.get("case_results") or ()),
                         action="Generated a correctness-verified kernel",
-                        lesson="Reuse only after validating shape, dtype, and device constraints.",
                         environment={
                             **collect_environment(),
                             "model": self.model_name,
+                            "execution_direction_source": direction_source,
+                            "request_digest": hashlib.sha256(
+                                problem_description.encode("utf-8")
+                            ).hexdigest(),
+                            "request_signature": request_signature.to_dict(),
+                            "reference_source_digest": (
+                                hashlib.sha256(reference_source.encode("utf-8"))
+                                .hexdigest() if reference_source else ""
+                            ),
+                            "reference_source_kind": (
+                                "verified_case_suite_reference" if companion and reference_source
+                                else "verified_test_0" if reference_source
+                                else "description_fallback"
+                            ),
                         },
-                    )
+                    ),
+                    session_id=session_dir.name,
+                    test_suite_hash=hashlib.sha256(
+                        json.dumps(test_code_list, sort_keys=True).encode()
+                    ).hexdigest(),
                 )
+                retrieval_id = getattr(self, "_last_experience_retrieval_id", None)
+                if retrieval_id:
+                    self.experience_store.set_retrieval_outcome(
+                        retrieval_id, {"success": True, "verified": True}
+                    )
+                self._finish_text_retrievals({"success": True, "verified": True})
 
             return {
                 "success": True,
@@ -834,6 +886,13 @@ def kernel_function(*args, **kwargs):
             }
         else:
             self.logger.warning("No worker found a successful solution")
+            if self.experience_store is not None:
+                retrieval_id = getattr(self, "_last_experience_retrieval_id", None)
+                if retrieval_id:
+                    self.experience_store.set_retrieval_outcome(
+                        retrieval_id, {"success": False}
+                    )
+                self._finish_text_retrievals({"success": False})
             return {
                 "success": False,
                 "message": "Failed to generate working kernel",

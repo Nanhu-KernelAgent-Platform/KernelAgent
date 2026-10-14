@@ -21,11 +21,14 @@ utilities, L2 cache clearing, and comprehensive statistics.
 import json
 import logging
 import os
+import math
 import shutil
 import subprocess
 import sys
+import statistics
 import tempfile
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
@@ -133,7 +136,7 @@ class Benchmark:
         """
         ptx_cache_dir = Path(tempfile.mkdtemp(prefix="triton_cache_bench_"))
         try:
-            with self.lock_manager:
+            with (nullcontext() if getattr(self, "_paired_lock_held", False) else self.lock_manager):
                 results_json = self.artifacts_dir / "benchmark_results.json"
                 benchmark_script = Path(__file__).parent / "kernel_subprocess.py"
 
@@ -189,13 +192,28 @@ class Benchmark:
 
                 kernel_name = kernel_file.stem
                 kernel_results = results.get("kernels", {}).get(kernel_name, {})
+                raw_samples = kernel_results.get("samples_ms", [])
+                samples = (
+                    [float(value) for value in raw_samples]
+                    if isinstance(raw_samples, list) and all(
+                        isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(value) and value > 0
+                        for value in raw_samples
+                    ) else []
+                )
 
                 # Capture the PTX fingerprint from the isolated cache dir.
                 # A None result is graceful — dedup treats it as a singleton.
                 ptx_hash = ptx_hash_from_cache(ptx_cache_dir)
 
                 return {
-                    "time_ms": kernel_results.get("time_ms", float("inf")),
+                    "time_ms": (
+                        statistics.median(samples) if samples
+                        else kernel_results.get("time_ms", float("inf"))
+                    ),
+                    "samples_ms": samples,
+                    "case_measurements": kernel_results.get("case_measurements", []),
+                    "aggregation": kernel_results.get("aggregation", "single_case"),
                     "speedup": kernel_results.get("speedup", 1.0),
                     "ptx_hash": ptx_hash,
                 }
@@ -205,6 +223,15 @@ class Benchmark:
             return {"time_ms": float("inf"), "speedup": 0.0, "ptx_hash": None}
         finally:
             shutil.rmtree(ptx_cache_dir, ignore_errors=True)
+
+    def benchmark_pair(self, parent, candidate, problem_file):
+        from triton_kernel_agent.measurement_policy import interleaved_pair
+        with self.lock_manager:
+            self._paired_lock_held = True
+            try:
+                return interleaved_pair(lambda path: self.benchmark_kernel(path, problem_file), parent, candidate)
+            finally:
+                self._paired_lock_held = False
 
     def benchmark_pytorch(
         self,
@@ -226,6 +253,28 @@ class Benchmark:
         """
         try:
             with self.lock_manager:
+                from triton_kernel_agent.opt_worker_component.benchmarking.timing import import_module
+                from triton_kernel_agent.case_suite import benchmark_cases
+                reference = import_module(problem_file, "explicit_pytorch_reference")
+                if (hasattr(reference, "get_test_cases") or
+                        getattr(reference, "KERNELAGENT_OPTIMIZATION_TARGET", "forward") == "backward"):
+                    def measure(invoke):
+                        for _ in range(self.warmup):
+                            invoke()
+                        torch.cuda.synchronize()
+                        samples = []
+                        for _ in range(3):
+                            start = torch.cuda.Event(enable_timing=True)
+                            end = torch.cuda.Event(enable_timing=True)
+                            start.record()
+                            for _ in range(self.repeat):
+                                invoke()
+                            end.record()
+                            torch.cuda.synchronize()
+                            samples.append(start.elapsed_time(end) / self.repeat)
+                        return samples
+                    return benchmark_cases(reference, None, "cuda",
+                        getattr(reference, "KERNELAGENT_OPTIMIZATION_TARGET", "forward"), measure)
                 model, inputs = prepare_pytorch_model(
                     problem_file=problem_file,
                     device="cuda",
@@ -284,6 +333,12 @@ class Benchmark:
         """
         try:
             with self.lock_manager:
+                from triton_kernel_agent.opt_worker_component.benchmarking.timing import import_module
+                reference = import_module(problem_file, "explicit_compiled_reference")
+                if (hasattr(reference, "get_test_cases") or
+                        getattr(reference, "KERNELAGENT_OPTIMIZATION_TARGET", "forward") == "backward"):
+                    self.logger.info("Compiled baseline skipped: primary-only timing cannot represent an explicit suite")
+                    return {"time_ms": float("inf"), "reason": "explicit_suite_compile_baseline_not_supported"}
                 model, inputs = prepare_pytorch_model(
                     problem_file=problem_file,
                     device="cuda",

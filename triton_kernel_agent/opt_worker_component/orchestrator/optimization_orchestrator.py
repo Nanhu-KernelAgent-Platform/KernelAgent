@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
+from triton_kernel_agent.experience.evidence import normalize_claims
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,12 @@ class OptimizationAttempt:
     config_changes: dict[str, str] = field(default_factory=dict)
     time_before_ms: float = 0.0
     time_after_ms: float = 0.0
+    kernel_samples_ms: list[float] = field(default_factory=list)
+    baseline_samples_ms: list[float] = field(default_factory=list)
+    case_results: list[dict[str, Any]] = field(default_factory=list)
+    case_measurements: list[dict[str, Any]] = field(default_factory=list)
+    comparison: dict[str, Any] = field(default_factory=dict)
+    evidence_baseline_ms: float | None = None
     improvement_pct: float = 0.0
     is_improvement: bool = False
     compute_sol_pct: float = 0.0
@@ -141,11 +149,16 @@ class Reflexion:
     was_fix_effective: bool = False
     reasoning: str = ""
     lessons: list[str] = field(default_factory=list)
+    claims: list[dict[str, Any]] = field(default_factory=list)
     avoid_patterns: list[str] = field(default_factory=list)
     try_patterns: list[str] = field(default_factory=list)
+    generation_status: str = "completed"
+    generation_error: str = ""
 
     def format_for_prompt(self) -> str:
         """Format reflexion for inclusion in optimization prompt."""
+        if self.generation_status == "failed":
+            return ""
         status = "Effective" if self.was_fix_effective else "Ineffective"
 
         lines = [
@@ -342,6 +355,7 @@ class OptimizationOrchestrator:
         self.logger.info("=" * 80)
         self.logger.info("Starting hardware-guided optimization")
         self.logger.info("=" * 80)
+        self._last_attempt_kernel_code: str | None = None
 
         # Initialize state
         current_kernel = kernel_code
@@ -499,6 +513,7 @@ class OptimizationOrchestrator:
             if not optimized_kernel:
                 error_feedback = "Failed to extract valid kernel code. Please provide complete kernel wrapped in ```python blocks."
                 continue
+            self._last_attempt_kernel_code = optimized_kernel
 
             # Verify and refine
             success, optimized_kernel, verify_error = self._verify_and_refine(
@@ -507,6 +522,9 @@ class OptimizationOrchestrator:
                 problem_description,
                 round_num,
             )
+            if optimized_kernel:
+                self._last_attempt_kernel_code = optimized_kernel
+            current_attempt.case_results = getattr(self.verification_worker, "last_case_results", [])
             if not success:
                 error_feedback = (
                     verify_error or "Previous attempt failed correctness check."
@@ -515,22 +533,44 @@ class OptimizationOrchestrator:
                 current_attempt.passed_verification = False
                 current_attempt.error_message = error_feedback
                 self.attempt_history.append(current_attempt)
+                reflection = self._generate_reflexion(current_attempt)
+                if reflection:
+                    self.reflexions.append(reflection)
                 continue
+
+            # Verification may return a refined source; benchmark and persist
+            # that exact source rather than the original proposal or best-so-far.
+            self._last_attempt_kernel_code = optimized_kernel
 
             error_feedback = ""
 
-            # Save and benchmark
-            kernel_file_round = _write_kernel_file(
-                self.artifact_dir / f"kernel_round_{round_num}.py",
-                optimized_kernel,
-                self.logger,
+            parent_bench, bench_results = self._benchmark_paired_candidate(
+                best_runtime_kernel, optimized_kernel, problem_file, round_num,
             )
+            parent_samples = parent_bench.get("samples_ms", [])
+            from triton_kernel_agent.case_suite import paired_cases
+            current_attempt.case_measurements = paired_cases(parent_bench, bench_results)
+            current_attempt.comparison = bench_results.get("comparison", {})
+            if (len(parent_samples) >= 3 and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value > 0
+                for value in parent_samples
+            )):
+                current_attempt.baseline_samples_ms = parent_samples
+                current_attempt.evidence_baseline_ms = parent_bench["time_ms"]
 
-            bench_results = self.benchmarker.benchmark_kernel(
-                kernel_file_round, problem_file
-            )
             new_time = bench_results["time_ms"]
+            current_attempt.kernel_samples_ms = bench_results.get("samples_ms", [])
             new_ptx_hash = bench_results.get("ptx_hash")
+            self.logger.info(
+                "[%s] Paired benchmark: parent=%s ms samples=%s; "
+                "candidate=%s ms samples=%s",
+                round_num,
+                parent_bench.get("time_ms"),
+                current_attempt.baseline_samples_ms,
+                new_time,
+                current_attempt.kernel_samples_ms,
+            )
 
             # Profile the NEW kernel to get its SOL metrics
             if self._profiling_unavailable:
@@ -565,7 +605,8 @@ class OptimizationOrchestrator:
             )
             current_attempt.time_after_ms = new_time
             current_attempt.improvement_pct = improvement_pct
-            current_attempt.is_improvement = new_time < best_runtime_time
+            current_attempt.is_improvement = bool(current_attempt.comparison.get("adopt")
+                                                  and new_time < best_runtime_time)
             current_attempt.passed_verification = True
             any_verified = True
             current_attempt.config_changes = config_changes
@@ -610,6 +651,7 @@ class OptimizationOrchestrator:
                 best_sol_time,
                 best_sol_sol,
                 round_num,
+                allow_runtime_improvement=current_attempt.is_improvement,
             )
 
             # Track metadata when new best runtime is found.  Note:
@@ -661,7 +703,11 @@ class OptimizationOrchestrator:
 
         # Profile the final best kernel to get its roofline
         if best_round_num > 0:
-            final_kernel_file = self.artifact_dir / f"kernel_round_{best_round_num}.py"
+            final_dir = self.artifact_dir / f"final_best_round_{best_round_num}"
+            final_dir.mkdir(parents=True, exist_ok=True)
+            final_kernel_file = _write_kernel_file(
+                final_dir / "kernel.py", best_runtime_kernel, self.logger,
+            )
             if final_kernel_file.exists():
                 self.logger.info(
                     f"Profiling final best kernel (round {best_round_num})..."
@@ -700,6 +746,42 @@ class OptimizationOrchestrator:
             any_verified,
             best_runtime_ptx_hash=best_runtime_ptx_hash,
         )
+
+    def _benchmark_paired_candidate(
+        self, parent_code: str, candidate_code: str,
+        problem_file: Path, round_num: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Measure the parent and candidate without overwriting native bundles."""
+        parent_dir = self.artifact_dir / f"paired_round_{round_num}" / "parent"
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        parent_file = _write_kernel_file(
+            parent_dir / "kernel.py", parent_code, self.logger,
+        )
+        candidate_file = _write_kernel_file(
+            self.artifact_dir / f"kernel_round_{round_num}.py",
+            candidate_code, self.logger,
+        )
+        pair_fn = getattr(self.benchmarker, "benchmark_pair", None)
+        if callable(pair_fn):
+            parent_result, candidate_result = pair_fn(parent_file, candidate_file, problem_file)
+        else:
+            parent_result = self.benchmarker.benchmark_kernel(parent_file, problem_file)
+            candidate_result = self.benchmarker.benchmark_kernel(candidate_file, problem_file)
+            from triton_kernel_agent.measurement_policy import compare
+            candidate_result["comparison"] = compare(parent_result.get("samples_ms", []),
+                                                       candidate_result.get("samples_ms", []))
+        from triton_kernel_agent.case_suite import measurement_is_covered, paired_cases
+        cases = candidate_result.get("case_measurements", [])
+        checked = getattr(getattr(self, "verification_worker", None), "last_case_results", [])
+        if (cases or checked) and (not measurement_is_covered(cases, checked)
+                or any(not row["benchmark"]["paired"] for row in paired_cases(parent_result, candidate_result))
+                or len(parent_result.get("case_measurements", [])) != len(cases)):
+            self.logger.warning("Rejecting suite score: correctness coverage or parent case pairing differs")
+            candidate_result = {**candidate_result, "time_ms": float("inf"), "samples_ms": []}
+            candidate_result["comparison"] = {**candidate_result.get("comparison", {}),
+                                              "adopt": False, "reason": "verification_coverage_mismatch"}
+        self.logger.info("Noise-aware comparison: %s", candidate_result.get("comparison"))
+        return parent_result, candidate_result
 
     def _benchmark_baseline(
         self,
@@ -1019,11 +1101,10 @@ class OptimizationOrchestrator:
             )
         )
 
-        if success:
-            from triton_kernel_agent.kernel_backend import KernelBundle
+        from triton_kernel_agent.kernel_backend import KernelBundle
 
-            if isinstance(final_kernel, KernelBundle):
-                final_kernel = final_kernel.render_for_prompt()
+        if isinstance(final_kernel, KernelBundle):
+            final_kernel = final_kernel.render_for_prompt()
 
         if success:
             self.logger.info(f"[{round_num}] ✅ Correctness check passed")
@@ -1054,11 +1135,12 @@ class OptimizationOrchestrator:
                 was_diagnosis_correct=False,
                 was_fix_effective=False,
                 reasoning=f"Attempt failed verification: {attempt.error_message[:200] if attempt.error_message else 'Unknown error'}",
-                lessons=["Ensure generated code passes correctness checks"],
+                lessons=[],
                 avoid_patterns=[
                     f"Similar approach to round {attempt.round_num} that failed verification"
                 ],
                 try_patterns=[],
+                generation_status="not_requested",
             )
 
         try:
@@ -1090,10 +1172,11 @@ class OptimizationOrchestrator:
             self.logger.warning(
                 f"[{attempt.round_num}] Failed to generate reflexion: {e}"
             )
-            return self._fallback_reflexion(attempt)
+            return self._fallback_reflexion(attempt, error=type(e).__name__)
 
     def _fallback_reflexion(
-        self, attempt: OptimizationAttempt, reasoning: str | None = None
+        self, attempt: OptimizationAttempt, reasoning: str | None = None,
+        *, error: str = "invalid_or_missing_response",
     ) -> Reflexion:
         """Create a basic reflexion from attempt data when LLM is unavailable."""
         return Reflexion(
@@ -1103,13 +1186,15 @@ class OptimizationOrchestrator:
             expected_outcome="Improve performance by addressing bottleneck",
             actual_outcome="Improved" if attempt.is_improvement else "No improvement",
             performance_delta_pct=attempt.improvement_pct,
-            was_diagnosis_correct=attempt.is_improvement,
-            was_fix_effective=attempt.is_improvement,
+            was_diagnosis_correct=False,
+            was_fix_effective=False,
             reasoning=reasoning
             or f"Performance changed by {attempt.improvement_pct:+.1f}%",
             lessons=[],
             avoid_patterns=[],
             try_patterns=[],
+            generation_status="failed",
+            generation_error=error,
         )
 
     def _parse_reflexion_response(
@@ -1121,6 +1206,8 @@ class OptimizationOrchestrator:
         if json_match:
             try:
                 data = json.loads(json_match.group())
+                if not isinstance(data, dict):
+                    return self._fallback_reflexion(attempt)
                 return Reflexion(
                     round_num=attempt.round_num,
                     root_cause_diagnosed=attempt.root_cause,
@@ -1138,6 +1225,7 @@ class OptimizationOrchestrator:
                     ),
                     reasoning=data.get("reasoning", ""),
                     lessons=data.get("lessons", []),
+                    claims=normalize_claims(data.get("claims")),
                     avoid_patterns=data.get("avoid_patterns", []),
                     try_patterns=data.get("try_patterns", []),
                 )
@@ -1163,6 +1251,7 @@ class OptimizationOrchestrator:
         best_sol_time: float,
         best_sol_sol: float,
         round_num: int,
+        allow_runtime_improvement: bool | None = None,
     ) -> tuple[str, str, float, float, str, float, float]:
         """Update current and best kernels based on performance and SOL.
 
@@ -1184,7 +1273,7 @@ class OptimizationOrchestrator:
         updated_sol_sol = best_sol_sol
 
         # Check for runtime improvement (independent of SOL)
-        if new_time < best_runtime_time:
+        if new_time < best_runtime_time and allow_runtime_improvement is not False:
             speedup = best_runtime_time / new_time
             improvement = (best_runtime_time - new_time) / best_runtime_time * 100
             self.logger.info(
@@ -1235,6 +1324,8 @@ class OptimizationOrchestrator:
                     )
             next_kernel = optimized_kernel
 
+        if allow_runtime_improvement is False:
+            next_kernel = best_runtime_kernel
         return (
             next_kernel,
             updated_runtime_kernel,
@@ -1341,10 +1432,18 @@ class OptimizationOrchestrator:
         if early_stop_reason:
             perf_metrics["early_stop_reason"] = early_stop_reason
 
+        if self.gpu_specs:
+            perf_metrics["hardware"] = str(self.gpu_specs.get("name") or "")
+            perf_metrics["architecture"] = str(
+                self.gpu_specs.get("architecture") or ""
+            )
+
         # Include last attempt and reflexion for shared history (beam search)
-        if self.attempt_history:
+        if self.attempt_history and self._last_attempt_kernel_code:
             perf_metrics["last_attempt"] = asdict(self.attempt_history[-1])
-        if self.reflexions:
+            perf_metrics["last_attempt_kernel_code"] = self._last_attempt_kernel_code
+        if (self.reflexions and self.attempt_history and
+                self.reflexions[-1].round_num == self.attempt_history[-1].round_num):
             perf_metrics["last_reflexion"] = asdict(self.reflexions[-1])
 
         success = best_runtime_time != float("inf") and any_verified

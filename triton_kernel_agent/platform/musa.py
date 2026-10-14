@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import statistics
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -49,7 +51,7 @@ _NORMALIZED_KEYS = {
 
 _BENCHMARK_SCRIPT = r"""import importlib.util, json, sys, torch
 import torch_musa
-from kernel_call_binding import bind_kernel_call
+from kernel_case_suite import benchmark_cases
 
 def load(path, name):
     parent = str(__import__("pathlib").Path(path).resolve().parent)
@@ -63,37 +65,29 @@ problem = load(sys.argv[1], "musa_problem")
 optimization_target = getattr(problem, "KERNELAGENT_OPTIMIZATION_TARGET", "forward")
 mode = sys.argv[2]
 warmup, repeat = int(sys.argv[3]), int(sys.argv[4])
-init_inputs = problem.get_init_inputs() if hasattr(problem, "get_init_inputs") else []
-if not isinstance(init_inputs, (list, tuple)): init_inputs = [init_inputs]
-model = problem.Model(*init_inputs) if init_inputs else problem.Model()
-model = model.to("musa")
-inputs = problem.get_inputs()
-if not isinstance(inputs, (list, tuple)): inputs = [inputs]
-if optimization_target == "backward":
-    inputs = [x.detach().requires_grad_(True) if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in inputs]
-inputs = [x.to("musa") if isinstance(x, torch.Tensor) else x for x in inputs]
-if mode == "kernel":
-    fn = load(sys.argv[5], "musa_kernel").kernel_function
-    invoke = bind_kernel_call(fn, model, inputs)
-else:
-    invoke = lambda: model(*inputs)
-if optimization_target == "backward":
-    output = invoke()
-    outputs = tuple(value for value in (output if isinstance(output, (tuple, list)) else (output,)) if isinstance(value, torch.Tensor) and value.requires_grad)
-    differentiable = tuple(value for value in (*inputs, *model.parameters()) if isinstance(value, torch.Tensor) and value.requires_grad)
-    if not outputs or not differentiable:
-        raise RuntimeError("backward benchmark requires differentiable tensor outputs and inputs")
-    grad_outputs = tuple(torch.ones_like(value) for value in outputs)
-    invoke = lambda: torch.autograd.grad(outputs, differentiable, grad_outputs=grad_outputs, retain_graph=True, allow_unused=True)
-for _ in range(warmup): invoke()
-torch.musa.synchronize()
-start = torch.musa.Event(enable_timing=True)
-end = torch.musa.Event(enable_timing=True)
-start.record()
-for _ in range(repeat): invoke()
-end.record()
-torch.musa.synchronize()
-print(json.dumps({"time_ms": start.elapsed_time(end) / repeat}))
+torch.manual_seed(0)
+def measure(invoke):
+    for _ in range(warmup): invoke()
+    torch.musa.synchronize()
+    samples = []
+    for _ in range(3):
+        start = torch.musa.Event(enable_timing=True)
+        end = torch.musa.Event(enable_timing=True)
+        start.record()
+        for _ in range(repeat): invoke()
+        end.record()
+        torch.musa.synchronize()
+        samples.append(start.elapsed_time(end) / repeat)
+    return samples
+# Single forward cases need the same contracts as their deterministic verifier.
+# load_cases supplies the default case even without get_test_cases().
+kernel = load(sys.argv[5], "musa_kernel").kernel_function if mode == "kernel" else None
+payload = benchmark_cases(problem, kernel, "musa", optimization_target, measure)
+try:
+    payload["hardware"] = torch.musa.get_device_name(torch.musa.current_device())
+except Exception:
+    payload["hardware"] = ""
+print(json.dumps(payload, allow_nan=False))
 """
 
 
@@ -216,6 +210,7 @@ class MusaVerifier(KernelVerifier):
             self.logger.error(
                 "Initial MUSA kernel verification failed: %s", error[:500]
             )
+        self.last_case_results = getattr(worker, "last_case_results", [])
         return success
 
 
@@ -235,10 +230,13 @@ class MusaBenchmarker(KernelBenchmarker):
         self.benchmark_lock = benchmark_lock
         self.warmup = warmup
         self.repeat = repeat
+        self.last_hardware = ""
 
-    def _run(
+    def _run_measurement(
         self, problem_file: Path, mode: str, kernel_file: Path | None = None
-    ) -> float:
+    ) -> dict[str, Any]:
+        failed = {"time_ms": float("inf"), "samples_ms": []}
+        self.last_case_measurements = []
         artifacts = self.log_dir / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
         script = artifacts / "musa_benchmark.py"
@@ -246,6 +244,8 @@ class MusaBenchmarker(KernelBenchmarker):
         shutil.copy2(
             Path(kernel_call_binding.__file__), artifacts / "kernel_call_binding.py"
         )
+        from triton_kernel_agent import case_suite
+        shutil.copy2(case_suite.__file__, artifacts / "kernel_case_suite.py")
         cmd = [
             sys.executable,
             str(script),
@@ -257,7 +257,8 @@ class MusaBenchmarker(KernelBenchmarker):
         if kernel_file is not None:
             cmd.append(str(kernel_file))
         try:
-            self.benchmark_lock.acquire()
+            if not getattr(self, "_paired_lock_held", False):
+                self.benchmark_lock.acquire()
             if kernel_file is not None:
                 build = subprocess.run(
                     [sys.executable, "setup.py", "build_ext", "--inplace"],
@@ -271,26 +272,93 @@ class MusaBenchmarker(KernelBenchmarker):
                         "MUSA benchmark extension build failed: %s",
                         (build.stderr or build.stdout)[-4000:],
                     )
-                    return float("inf")
+                    return failed
             result = subprocess.run(
                 cmd, cwd=artifacts, capture_output=True, text=True, timeout=600
             )
         except Exception as exc:
             self.logger.error("MUSA benchmark failed: %s", exc)
-            return float("inf")
+            return failed
         finally:
             try:
-                self.benchmark_lock.release()
+                if not getattr(self, "_paired_lock_held", False):
+                    self.benchmark_lock.release()
             except Exception:
                 pass
         if result.returncode != 0:
             self.logger.error("MUSA benchmark failed: %s", result.stderr[-2000:])
-            return float("inf")
+            return failed
         try:
-            return float(json.loads(result.stdout.strip().splitlines()[-1])["time_ms"])
-        except (IndexError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            payload = json.loads(result.stdout.strip().splitlines()[-1])
+            samples = [float(value) for value in payload["samples_ms"]]
+            from triton_kernel_agent.case_suite import valid_samples
+            if not valid_samples(samples, 3):
+                raise ValueError("expected three positive finite timing samples")
+            if isinstance(payload.get("hardware"), str):
+                self.last_hardware = payload["hardware"].strip()
+            rows = payload.get("case_measurements", [])
+            if not isinstance(rows, list):
+                raise ValueError("case_measurements must be a list")
+            for row in rows:
+                case_samples = row["samples_ms"]
+                if not valid_samples(case_samples, 3):
+                    raise ValueError("invalid per-case samples")
+            self.last_case_measurements = rows
+            return {"time_ms": statistics.median(samples), "samples_ms": samples,
+                    "case_measurements": rows, "aggregation": payload.get("aggregation", "single_case")}
+        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.logger.error("Invalid MUSA benchmark output: %s", exc)
-            return float("inf")
+            return failed
+
+    def _run(
+        self, problem_file: Path, mode: str, kernel_file: Path | None = None
+    ) -> float:
+        return self._run_measurement(problem_file, mode, kernel_file)["time_ms"]
+
+    def benchmark_pair(self, parent, candidate, problem_file):
+        from triton_kernel_agent.measurement_policy import interleaved_pair
+        paths = []
+        for role, source in (("parent", parent), ("candidate", candidate)):
+            if isinstance(source, Path):
+                paths.append(source)
+                continue
+            bundle = source if isinstance(source, KernelBundle) else extract_kernel_bundle(source)
+            if bundle is None:
+                raise ValueError("paired MUSA benchmark requires complete native bundles")
+            directory = self.log_dir / "paired_artifacts" / role
+            directory.mkdir(parents=True, exist_ok=True)
+            for name, content in bundle.files.items():
+                (directory / name).write_text(content, encoding="utf-8")
+            paths.append(directory / "kernel.py")
+        self.benchmark_lock.acquire()
+        self._paired_lock_held = True
+        try:
+            before, after = interleaved_pair(lambda path: self.benchmark_kernel(path, problem_file), *paths)
+            self.last_case_measurements = after.get("case_measurements", [])
+            return before, after
+        finally:
+            self._paired_lock_held = False
+            self.benchmark_lock.release()
+
+    def benchmark_kernel_samples(
+        self, kernel_code: Any, problem_file: Path
+    ) -> list[float]:
+        """Measure three windows after one native build and warmup."""
+        bundle = (
+            kernel_code if isinstance(kernel_code, KernelBundle)
+            else KernelBundle(kernel_code) if isinstance(kernel_code, dict)
+            else extract_kernel_bundle(kernel_code)
+        )
+        if bundle is None:
+            self.logger.error("MUSA benchmark requires a multi-file kernel bundle")
+            return []
+        artifacts = self.log_dir / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        for name, content in bundle.files.items():
+            (artifacts / name).write_text(content, encoding="utf-8")
+        return self._run_measurement(
+            problem_file, "kernel", artifacts / "kernel.py"
+        )["samples_ms"]
 
     def benchmark_kernel(self, kernel_code: Any, problem_file: Path) -> Any:
         # OptimizationManager passes a rendered bundle and expects a float;
@@ -303,8 +371,8 @@ class MusaBenchmarker(KernelBenchmarker):
             if not all((kernel_file.parent / name).is_file() for name in required):
                 self.logger.error("MUSA benchmark requires a four-file bundle")
                 return {"time_ms": float("inf"), "speedup": 0.0, "ptx_hash": None}
-            time_ms = self._run(problem_file, "kernel", kernel_file)
-            return {"time_ms": time_ms, "speedup": 1.0, "ptx_hash": None}
+            measurement = self._run_measurement(problem_file, "kernel", kernel_file)
+            return {**measurement, "speedup": 1.0, "ptx_hash": None}
 
         bundle = (
             kernel_code

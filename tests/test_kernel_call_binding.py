@@ -67,3 +67,41 @@ def test_varargs_receive_forward_inputs_then_parameters():
         return args
 
     assert bind_kernel_call(kernel_function, model, [x])() == (x, model.weight)
+
+
+def test_binds_composite_kernel_state_to_named_submodules():
+    conv_weight, conv_bias, fc_weight, fc_bias = (object() for _ in range(4))
+
+    class Composite(FakeModel):
+        def named_parameters(self):
+            return iter((
+                ("conv.weight", conv_weight), ("conv.bias", conv_bias),
+                ("fc1.weight", fc_weight), ("fc1.bias", fc_bias),
+            ))
+
+        def named_buffers(self):
+            return iter(())
+
+    x = object()
+
+    def kernel_function(x, conv_weight, conv_bias, fc_weight, fc_bias):
+        return x, conv_weight, conv_bias, fc_weight, fc_bias
+
+    assert bind_kernel_call(kernel_function, Composite(), [x])() == (
+        x, conv_weight, conv_bias, fc_weight, fc_bias,
+    )
+
+
+def test_numbered_submodule_alias_must_be_unambiguous():
+    class Composite(FakeModel):
+        def named_parameters(self):
+            return iter((("fc1.weight", object()), ("fc2.weight", object())))
+
+        def named_buffers(self):
+            return iter(())
+
+    def kernel_function(x, fc_weight):
+        return x, fc_weight
+
+    with pytest.raises(KernelCallBindingError, match="Ambiguous model state"):
+        bind_kernel_call(kernel_function, Composite(), [object()])
