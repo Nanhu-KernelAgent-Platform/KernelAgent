@@ -47,6 +47,12 @@ from triton_kernel_agent.experience import (
     format_verified_seed_context,
 )
 
+# How many complete-format repair requests to spend when a MUSA seed came back
+# malformed. A single repair is not enough for verbose reasoning models that
+# exhaust the completion budget mid-thought, because the repair prompt is longer
+# than the seed prompt and tends to truncate again.
+MUSA_SEED_REPAIR_ATTEMPTS = 3
+
 
 def _parse_reference_problem(problem_description: str):
     """Parse the final Describe2 produced for this request, if present."""
@@ -507,7 +513,18 @@ class TritonKernelAgent:
 
                 def extract_seed(response_text: str, seed_index: int, label: str):
                     try:
-                        return self._extract_kernel_payload(response_text)
+                        payload = self._extract_kernel_payload(response_text)
+                        # _extract_kernel_payload returns None (rather than
+                        # raising) when no FILE block is recognized at all, e.g.
+                        # when the model spent its entire budget before emitting
+                        # the bundle. Without this the response was never recorded
+                        # as invalid and the complete-format repair below was
+                        # skipped entirely.
+                        if payload is None:
+                            raise ValueError(
+                                "no FILE block was recognized in the model response"
+                            )
+                        return payload
                     except ValueError as exc:
                         bundle = extract_kernel_bundle(response_text)
                         recognized = sorted(bundle.files) if bundle else []
@@ -577,42 +594,54 @@ class TritonKernelAgent:
                     and self._kernel_backend.name == "musa"
                     and invalid_musa_responses
                 ):
-                    seed_index, invalid_response = invalid_musa_responses[-1]
-                    self.logger.info(
-                        "Requesting one complete-format repair for MUSA kernel seed %d",
-                        seed_index,
-                    )
-                    repair_messages = [
-                        *messages,
-                        {"role": "assistant", "content": invalid_response},
-                        {
-                            "role": "user",
-                            "content": (
-                                "Regenerate the complete native MUSA bundle. The prior "
-                                "answer was incomplete or used unsupported file headers. "
-                                "Return all four files with the literal headers "
-                                "FILE: kernel.py, FILE: binding.cpp, FILE: kernel.mu, and "
-                                "FILE: setup.py. Put each header immediately before its "
-                                "fenced code block and return no prose."
-                            ),
-                        },
-                    ]
-                    repaired_response = self._call_llm(
-                        repair_messages,
-                        max_tokens=max_completion_tokens,
-                        temperature=0.2,
-                    )
-                    repaired_kernel = extract_seed(
-                        repaired_response,
-                        seed_index,
-                        f"seed_{seed_index}_repair_invalid_response",
-                    )
-                    if repaired_kernel:
-                        kernels.append(repaired_kernel)
+                    # One repair is not enough when the model keeps exhausting the
+                    # completion budget in the middle of its reasoning: the repair
+                    # prompt is itself longer than the seed prompt, so a single
+                    # retry often truncates again. Retry the complete-format
+                    # repair a bounded number of times before giving up.
+                    for attempt in range(1, MUSA_SEED_REPAIR_ATTEMPTS + 1):
+                        seed_index, invalid_response = invalid_musa_responses[-1]
                         self.logger.info(
-                            "Successfully repaired MUSA kernel seed %d output format",
+                            "Requesting complete-format repair %d/%d for MUSA kernel seed %d",
+                            attempt,
+                            MUSA_SEED_REPAIR_ATTEMPTS,
                             seed_index,
                         )
+                        repair_messages = [
+                            *messages,
+                            {"role": "assistant", "content": invalid_response},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Regenerate the complete native MUSA bundle. The prior "
+                                    "answer was incomplete or used unsupported file headers. "
+                                    "Return all four files with the literal headers "
+                                    "FILE: kernel.py, FILE: binding.cpp, FILE: kernel.mu, and "
+                                    "FILE: setup.py. Put each header immediately before its "
+                                    "fenced code block and return no prose. Do not deliberate: "
+                                    "emit the four files directly."
+                                ),
+                            },
+                        ]
+                        repaired_response = self._call_llm(
+                            repair_messages,
+                            max_tokens=max_completion_tokens,
+                            temperature=0.2,
+                        )
+                        repaired_kernel = extract_seed(
+                            repaired_response,
+                            seed_index,
+                            f"seed_{seed_index}_repair_{attempt}_invalid_response",
+                        )
+                        if repaired_kernel:
+                            kernels.append(repaired_kernel)
+                            self.logger.info(
+                                "Successfully repaired MUSA kernel seed %d output format "
+                                "on repair attempt %d",
+                                seed_index,
+                                attempt,
+                            )
+                            break
 
                 if kernels:
                     self.logger.info(
@@ -669,6 +698,18 @@ def kernel_function(*args, **kwargs):
             bundle = extract_kernel_bundle(response_text)
             if bundle is not None:
                 bundle.require(self._kernel_backend)
+                # A response truncated by the max_tokens cap, or salvaged out of
+                # reasoning_content, can still carry all four FILE headers while
+                # the kernel.py body is incomplete. require() only checks that the
+                # filenames are present, so accept the bundle only when the
+                # wrapper really defines the entry point. Raising here routes the
+                # response into the existing "repair the complete format" retry
+                # instead of aborting before any verification round can run.
+                wrapper = bundle.files.get("kernel.py", "")
+                if "def kernel_function" not in wrapper:
+                    raise ValueError(
+                        "kernel.py is missing required kernel_function definition"
+                    )
             return bundle
         return self._extract_code_from_response(
             response_text,
