@@ -19,6 +19,7 @@ import os
 from typing import Any
 from .base import BaseProvider, LLMResponse
 from .env_config import configure_proxy_environment
+from ..token_ledger import record as _record_tokens
 
 try:
     from openai import OpenAI
@@ -80,7 +81,7 @@ class OpenAICompatibleProvider(BaseProvider):
             # Initialize client (proxy configured via environment variables)
             client_kwargs: dict[str, Any] = {
                 "api_key": api_key,
-                "timeout": float(os.getenv("OPENAI_TIMEOUT_S", "600")),
+                "timeout": float(os.getenv("OPENAI_TIMEOUT_S", "2700")),
             }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
@@ -132,11 +133,13 @@ class OpenAICompatibleProvider(BaseProvider):
             getattr(response, "id", None),
             getattr(response, "model", model_name),
         )
+        _usage = self._usage_dict(response)
+        _record_tokens(_usage)
         return LLMResponse(
             content=getattr(response, "output_text", "") or "",
             model=getattr(response, "model", model_name),
             provider=self.name,
-            usage=self._usage_dict(response),
+            usage=_usage,
             response_id=getattr(response, "id", None),
         )
 
@@ -156,12 +159,13 @@ class OpenAICompatibleProvider(BaseProvider):
             "OpenAI chat response (single): %s",
             getattr(response, "model_dump", lambda: str(response))(),
         )
-
+        _usage = self._usage_dict(response)
+        _record_tokens(_usage)
         return LLMResponse(
             content=response.choices[0].message.content,
             model=model_name,
             provider=self.name,
-            usage=self._usage_dict(response),
+            usage=_usage,
         )
 
     def get_multiple_responses(
@@ -183,13 +187,14 @@ class OpenAICompatibleProvider(BaseProvider):
             "OpenAI chat response (multi): %s",
             getattr(response, "model_dump", lambda: str(response))(),
         )
-
+        _usage = self._usage_dict(response)
+        _record_tokens(_usage)  # one API call -> record once (not per choice)
         return [
             LLMResponse(
                 content=choice.message.content,
                 model=model_name,
                 provider=self.name,
-                usage=self._usage_dict(response),
+                usage=_usage,
             )
             for choice in response.choices
         ]

@@ -31,6 +31,8 @@ class OpenAIProvider(OpenAICompatibleProvider):
 
     def get_max_tokens_limit(self, model_name: str) -> int:
         """Get the output-token limit used by KernelAgent requests."""
+        if "musacoder" in model_name.lower():
+            return 16384
         if model_name.startswith("gpt-5.6"):
             return 128000
         if model_name.startswith(("gpt-5", "gpt-4", "o3", "o1")):
