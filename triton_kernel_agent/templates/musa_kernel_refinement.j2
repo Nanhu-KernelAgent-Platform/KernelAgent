@@ -20,6 +20,19 @@ stderr: {{ error_info.stderr }}
 {{ kernel_guidance }}
 {{ triton_guidelines }}
 
+## Native contract (check before repairing)
+- Backend-correct headers: kernel.mu is compiled by mcc (MUSA), so include MUSA
+  runtime headers such as `<musa_runtime.h>`. CUDA-only headers (`<cuda.h>`,
+  `<cuda_runtime.h>`) do not exist in this toolchain and abort the build; use
+  them only when the target backend is CUDA, never in a MUSA file.
+- Evaluation call convention: `kernel_function` is called with exactly the
+  tensors returned by `get_inputs()`, positionally, in that order. Values from
+  `get_init_inputs()` (e.g. `dim`) are fixed at reference-model construction, so
+  bake them into kernel.py (module constant, closure, or `autograd.Function`
+  argument) instead of adding an extra required parameter — a signature such as
+  `kernel_function(input, dim)` fails with "Cannot bind required kernel
+  parameter(s): dim".
+
 Return the complete kernel.py, binding.cpp, kernel.mu, and setup.py using fenced
 FILE blocks. Put each literal FILE: filename header outside and immediately
 before its code fence. Return no prose and never copy reference Models, input

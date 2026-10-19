@@ -13,6 +13,23 @@ Generate a complete correctness test for a native MUSA kernel bundle.
 Requirements:
 - Return one complete fenced Python file and no prose.
 - Import `torch` and `torch_musa`, then import `kernel_function` from `kernel`.
+- The test must be SELF-CONTAINED. Every single name the file references must be
+  either imported by the file or defined at MODULE TOP LEVEL in the file. The
+  test file is generated ONCE and reused for every repair round, so a missing
+  name can never be fixed later and it silently fails the entire problem.
+  Observed fatal cases you must avoid:
+    * `class Model(nn.Module):` without `import torch.nn as nn`
+      -> NameError: name 'nn' is not defined
+    * calling `Model(*get_init_inputs())` when the `Model` class was never
+      defined at module top level (or was nested inside another function)
+      -> NameError: name 'Model' is not defined
+    * referencing helper names such as `setup`, `problem`, `case_reference`,
+      `move_case` or anything else the file does not itself define or import
+      -> NameError: name 'setup' is not defined
+  Therefore: emit `import torch.nn as nn` whenever you use `nn`, define the
+  reference `Model` class at MODULE TOP LEVEL next to the factories (never
+  nested inside `main()` or another function, and define it before first use),
+  and never reference a name you have not defined or imported.
 - Use device='musa' for inputs, parameters, the reference model, and outputs.
 - Import `move` from `kernel_case_suite` and use `move(get_inputs(), 'musa')`
   to transfer factory inputs. Plain tensor `.to()`/`.cuda()` can compact sliced
@@ -24,6 +41,29 @@ Requirements:
 - When the problem defines `get_inputs()` or `get_init_inputs()`, reproduce those
   function definitions without changing their values, shapes, dtypes, seeds, or
   argument order, and CALL them to construct the correctness workload.
+- MANDATORY PLACEMENT: define `get_inputs()` and `get_init_inputs()` at MODULE
+  TOP LEVEL of the generated test file, i.e. directly in the file body and
+  outside `main()`. A definition nested inside `main()`, a class, or any other
+  function does not count and makes the whole test invalid.
+- MANDATORY ISOLATION: apart from the reference `Model` class and those two
+  factories (plus the module-level constants they reference), ALL other test
+  flow MUST live inside `def main()` -- model instantiation, moving inputs to
+  the device, forward/backward calls, comparisons and PASS/FAIL reporting.
+  The module top level must contain ONLY imports, the `Model` class, the two
+  factories, and the constants they reference. In particular, never place
+  module-level assignments whose target names collide with local variables
+  used INSIDE the factories (e.g. `x`, `inputs`, `y`, `out`, `result`): a
+  top-level `x = inputs[0]` makes name resolution attribute that assignment to
+  `get_inputs()` and the input-contract check then rejects an otherwise
+  identical factory as "changed". Write `def main(): inputs = move(get_inputs(),
+  'musa'); x = inputs[0]; ...` instead.
+- MANDATORY FIDELITY: copy both factories VERBATIM from the problem, and copy
+  every module-level constant they reference verbatim at top level as well,
+  keeping the problem's own names and expressions (e.g. if the problem writes
+  `N = 2048 * 2`, write exactly `N = 2048 * 2`). Do not rename, inline,
+  reorder, or arithmetically rewrite them, and never substitute constant names
+  of your own. The generated file must carry the identical factory source and
+  the identical referenced constants.
 - Instantiate `Model(*get_init_inputs())` (or `Model()` only when the factory is
   absent/empty), then move the returned tensor inputs to MUSA without changing
   non-tensor arguments. Pass the same logical inputs to the reference Model and

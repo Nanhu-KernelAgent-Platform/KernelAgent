@@ -6,6 +6,69 @@ Generate a native MUSA extension bundle.
   must be repaired in the test, never through global side effects in kernel.py.
 - kernel.py must expose kernel_function and load the extension built by setup.py.
 - setup.py must use torch_musa.utils.musa_extension.MUSAExtension and BuildExtension.
+- Keep extra_compile_args minimal and portable: 'cxx': ['-O3', '-std=c++17'] and
+  'mcc': ['-O3']. Do NOT pass nvcc-only options such as --expt-relaxed-constexpr,
+  --expt-extended-lambda, -gencode or -arch=sm_*; the MUSA toolchain is clang
+  based and rejects them, which aborts the whole build.
+- binding.cpp must dispatch on the SAME scalar type it passes. With
+  AT_DISPATCH_FLOATING_TYPES, take the pointer types from `scalar_t` inside the
+  lambda and never call a float instantiation with double pointers (or vice versa).
+- MANDATORY: a template launcher DEFINED in kernel.mu MUST be explicitly
+  instantiated at the end of kernel.mu. The launcher template is defined in
+  kernel.mu but CALLED from binding.cpp, and C++ cannot implicitly instantiate a
+  template from another translation unit where its definition is not visible.
+  For AT_DISPATCH_FLOATING_TYPES emit instantiations for BOTH float and double,
+  with parameter lists identical to the definition:
+      template void launch_xxx<float>(const float* in, float* out, int64_t n);
+      template void launch_xxx<double>(const double* in, double* out, int64_t n);
+  Omitting them still COMPILES but fails at import with
+  "undefined symbol: _Z...launch_xxx...". Do NOT assume the dispatch macro will
+  instantiate them for you: it only instantiates what it can see in binding.cpp.
+  Simplest alternative that also avoids the problem: make the launcher a
+  non-template function that switches on the dtype itself.
+- Do not invent PyTorch C++ API names. `torch::kContiguous`,
+  `torch::kFloat32`, `at::musa::...` helpers you are unsure about do not exist.
+  For the output just reuse `A.options()` (optionally `.dtype(A.scalar_type())`)
+  or `torch::empty({M, N}, A.options())`; never call `.layout(torch::kContiguous)`.
+- NEVER fetch or pass a MUSA stream. These do not exist in this environment and
+  are the single most common build failure:
+    at::musa::getCurrentStream()   at::musa::getCurrentCUDAStream()
+    c10::musa::getCurrentMUSAStream()   c10::cuda::getCurrentCUDAStream()
+    musaStream_t / cudaStream_t locals, and `#include <c10/musa/Stream.h>`
+    (also `#include <c10/cuda/CUDAStream.h>`).
+  Launch on the default stream with the plain `kernel<<<grid, block>>>(args)`
+  form and pass NO stream argument to the launcher. Ordering comes from the
+  test's torch.musa.synchronize(). binding.cpp should include only
+  <torch/extension.h> and <ATen/ATen.h>.
+- NEVER write a kernel launch (`<<<grid, block>>>`) inside binding.cpp. That file
+  is compiled by the HOST `c++` compiler, which cannot parse launch syntax, so
+  `softmax_kernel<scalar_t><<<grid, block>>>(...)` in binding.cpp is a hard build
+  failure ("expected primary-expression before '<' token"). The `<<<...>>>`
+  launch belongs ONLY in kernel.mu (compiled by mcc). binding.cpp must just call
+  a plain C++ launcher function that it declares and that kernel.mu defines —
+  the launcher itself does the `<<<...>>>` launch internally.
+- Keep every cross-file signature literally identical between its declaration in
+  binding.cpp, its definition in kernel.mu, and its explicit instantiations.
+  Count the parameters: calling `launch_matmul<scalar_t>(...)` with more
+  arguments than the declared `launch_matmul` takes is a hard compile error.
+  Simplest safe shape: declare and define ONE function that takes only pointers
+  and ints (no dim3, no stream), and call it with exactly those arguments.
+- The declaration and the definition MUST be the SAME KIND (template vs
+  non-template). Pick ONE of these two shapes and use it on both sides:
+    (a) TEMPLATE — kernel.mu: `template <typename scalar_t> void launch_xxx(const
+        scalar_t* in, scalar_t* out, int64_t n) {...}` plus explicit
+        instantiations; binding.cpp: the SAME `template <typename scalar_t>`
+        declaration, and call `launch_xxx<scalar_t>(...)`.
+    (b) PLAIN OVERLOADS — kernel.mu: non-template `void launch_xxx(const float*
+        in, float* out, int64_t n)` and `void launch_xxx(const double* in,
+        double* out, int64_t n)`; binding.cpp: declare those same two overloads
+        and call the matching one.
+  NEVER mix them: a non-template declaration in binding.cpp with a template
+  definition in kernel.mu produces DIFFERENT mangled symbols, so the template
+  instantiation never satisfies the call and you get `undefined symbol` whose
+  demangled name has NO `<double>` template argument
+  (e.g. `launch_xxx(double const*, double*, long)` vs
+  `launch_xxx<double>(double const*, double*, long)`).
 - binding.cpp contains only the PyTorch binding and launch dispatch glue.
 - Keep all tensors and synchronization on torch.musa.
 - Return every required source file using the exact FILE block format.

@@ -13,6 +13,18 @@ Generate a correct, efficient native MUSA kernel for the following problem.
 {{ kernel_guidance }}
 {{ triton_guidelines }}
 
+## Native contract
+- Backend-correct headers: kernel.mu is compiled by mcc (MUSA), so include MUSA
+  runtime headers such as `<musa_runtime.h>`. CUDA-only headers (`<cuda.h>`,
+  `<cuda_runtime.h>`) do not exist in this toolchain and abort the build; use
+  them only when the target backend is CUDA, never in a MUSA file.
+- Evaluation call convention: `kernel_function` is called with exactly the
+  tensors returned by `get_inputs()`, positionally, in that order. Values from
+  `get_init_inputs()` (e.g. `dim`) are fixed at reference-model construction, so
+  bake them into kernel.py (module constant, closure, or `autograd.Function`
+  argument) instead of adding an extra required parameter — otherwise the
+  harness fails with "Cannot bind required kernel parameter(s)".
+
 Return exactly four fenced FILE blocks and no prose: kernel.py, binding.cpp,
 kernel.mu, and setup.py.
 
