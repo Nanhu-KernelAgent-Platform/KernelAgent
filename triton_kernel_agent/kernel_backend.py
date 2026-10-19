@@ -38,6 +38,22 @@ _COMMENT_FILE_BLOCK_RE = re.compile(
     r"(?:\#|//)[ \t]*FILE[ \t]*:[ \t]*([^\r\n]+)\r?\n(.*?)```",
     re.DOTALL | re.IGNORECASE,
 )
+# Some models open the fence first and put a bare `FILE: name` marker on the
+# first line inside it, instead of the documented `FILE: name` + fence order.
+# Accept that ordering too; the comment prefix is optional here.
+#
+# The negative lookahead is essential: without it this pattern also matches the
+# *closing* fence of the previous file followed by the next `FILE: name` line
+# and that file's *opening* fence, yielding an empty body. Because
+# extract_kernel_bundle merges matches into a dict, those empty matches would
+# overwrite the correct bodies produced by _FILE_BLOCK_RE and silently reduce
+# every non-first file to a blank placeholder.
+_FENCE_THEN_FILE_BLOCK_RE = re.compile(
+    r"(?:^|\n)[ \t]*```[^\r\n]*\r?\n[ \t]*"
+    r"(?:\#|//)?[ \t]*FILE[ \t]*:[ \t]*([^\r\n]+?)[ \t]*\r?\n"
+    r"(?![ \t]*```)(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
 
 _CANONICAL_MUSA_FILENAMES = {
     name.lower(): name for name in ("kernel.py", "binding.cpp", "kernel.mu", "setup.py")
@@ -167,6 +183,7 @@ def extract_kernel_bundle(response_text: str) -> KernelBundle | None:
     matches.extend(_MARKDOWN_HEADING_FILE_BLOCK_RE.findall(text))
     matches.extend(_FENCE_FILENAME_BLOCK_RE.findall(text))
     matches.extend(_COMMENT_FILE_BLOCK_RE.findall(text))
+    matches.extend(_FENCE_THEN_FILE_BLOCK_RE.findall(text))
     if not matches:
         return None
     return KernelBundle(
