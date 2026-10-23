@@ -112,13 +112,25 @@ def validate_test_autograd(source: str) -> None:
             return {node.id}
         return set().union(*(dependencies(child) for child in ast.iter_child_nodes(node)))
 
-    def check_block(statements, blocked, live, disabled=False):
+    # Names whose most recent assignment is a direct torch factory call.
+    # A tensor created by a torch factory is a fresh leaf, so setting
+    # ``X.requires_grad = True`` on it is valid. Any derived tensor (e.g. a
+    # ``.clone()`` result) is not a leaf, and setting the attribute would fail
+    # at runtime -- flag it statically instead of failing 8 refinement rounds.
+    FACTORY_CALLS = {
+        "torch.randn", "torch.rand", "torch.randn_like", "torch.rand_like",
+        "torch.zeros", "torch.ones", "torch.empty", "torch.full",
+        "torch.zeros_like", "torch.ones_like", "torch.empty_like",
+        "torch.arange", "torch.tensor",
+    }
+
+    def check_block(statements, blocked, live, leaf_tensors, disabled=False):
         for stmt in statements:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                check_block(stmt.body, set(), set())
+                check_block(stmt.body, set(), set(), set())
                 continue
             if isinstance(stmt, ast.ClassDef):
-                check_block(stmt.body, set(), set())
+                check_block(stmt.body, set(), set(), set())
                 continue
             if isinstance(stmt, (ast.With, ast.AsyncWith)):
                 mode = disabled
@@ -130,7 +142,7 @@ def validate_test_autograd(source: str) -> None:
                             mode = True
                         elif name == "torch.enable_grad":
                             mode = False
-                check_block(stmt.body, blocked, live, mode)
+                check_block(stmt.body, blocked, live, leaf_tensors, mode)
                 continue
             # Scan this statement's expressions, not nested function/control bodies.
             expressions = [child for child in ast.iter_child_nodes(stmt)
@@ -157,6 +169,21 @@ def validate_test_autograd(source: str) -> None:
                 value = stmt.value
                 if value is not None:
                     targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                    # 2-1 rule: reject ``X.requires_grad = True`` when ``X`` has not
+                    # been created as a fresh torch-factory leaf tensor.
+                    for t in targets:
+                        if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                                and t.attr == "requires_grad"
+                                and isinstance(value, ast.Constant) and value.value is True
+                                and t.value.id not in leaf_tensors):
+                            raise ValueError(
+                                "Invalid correctness test: only a fresh leaf tensor "
+                                "(e.g. torch.randn(...), or a factory with "
+                                "requires_grad=True) may have .requires_grad set to True, "
+                                f"not a derived tensor at line {t.lineno}. A value such as "
+                                ".clone() is not a leaf and fails at runtime; "
+                                "repair the test, not the kernel."
+                            )
                     names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
                     value_dependencies = dependencies(value)
                     # Restoring a leaf is not restoring the detached reference's derivatives.
@@ -165,12 +192,7 @@ def validate_test_autograd(source: str) -> None:
                             and value.func.attr == "requires_grad_"
                             and (not value.args or not isinstance(value.args[0], ast.Constant)
                                  or value.args[0].value is True))
-                    factory = (isinstance(value, ast.Call) and dotted(value.func) in {
-                        "torch.randn", "torch.rand", "torch.randn_like", "torch.rand_like",
-                        "torch.zeros", "torch.ones", "torch.empty", "torch.full",
-                        "torch.zeros_like", "torch.ones_like", "torch.empty_like",
-                        "torch.arange", "torch.tensor",
-                    })
+                    factory = (isinstance(value, ast.Call) and dotted(value.func) in FACTORY_CALLS)
                     factory_grad = factory and any(
                         k.arg == "requires_grad" and isinstance(k.value, ast.Constant)
                         and k.value.value is True for k in value.keywords)
@@ -189,20 +211,32 @@ def validate_test_autograd(source: str) -> None:
                             live.update(names)
                         else:
                             live.difference_update(names)
+                    # Track leaf status for the 2-1 rule: a plain name assigned a
+                    # torch-factory value is a leaf; any other assignment revokes it.
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            if factory:
+                                leaf_tensors.add(t.id)
+                            else:
+                                leaf_tensors.discard(t.id)
             # Branch-local assignments must not erase another possible blocked path.
             for field in ("body", "orelse", "finalbody"):
                 body = getattr(stmt, field, None)
                 if isinstance(body, list):
                     branch = set(blocked)
                     branch_live = set(live)
-                    check_block(body, branch, branch_live, disabled)
+                    branch_leaves = set(leaf_tensors)
+                    check_block(body, branch, branch_live, branch_leaves, disabled)
                     blocked.update(branch)
                     live.intersection_update(branch_live)
+                    leaf_tensors.update(branch_leaves)
             for handler in getattr(stmt, "handlers", []):
                 branch = set(blocked)
                 branch_live = set(live)
-                check_block(handler.body, branch, branch_live, disabled)
+                branch_leaves = set(leaf_tensors)
+                check_block(handler.body, branch, branch_live, branch_leaves, disabled)
                 blocked.update(branch)
                 live.intersection_update(branch_live)
+                leaf_tensors.update(branch_leaves)
 
-    check_block(tree.body, set(), set())
+    check_block(tree.body, set(), set(), set())

@@ -36,6 +36,12 @@ Requirements:
   tensors. Preserve shape, dtype and strides; model.to('musa') remains valid.
 - Check availability with `torch.musa.is_available()` and synchronize with
   `torch.musa.synchronize()` when needed. Do not use torch.cuda APIs.
+- IMPORT RULE (MANDATORY): import the MUSA backend with exactly `import torch_musa`.
+  NEVER write `import torch.musa`, `from torch.musa import ...`, or
+  `from torch.musa import ... as ...`. `torch.musa` is a backend *attribute*,
+  not an importable submodule, so those forms raise
+  `ModuleNotFoundError: No module named 'torch.musa'`. After `import torch_musa`
+  only reference the API as `torch.musa.<function>(...)`.
 - Call kernel_function as a normal Python function. The native extension build
   and launch details belong to kernel.py, binding.cpp, kernel.mu, and setup.py.
 - When the problem defines `get_inputs()` or `get_init_inputs()`, reproduce those

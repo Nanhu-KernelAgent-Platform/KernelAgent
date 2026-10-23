@@ -37,6 +37,7 @@ from triton_kernel_agent.kernel_backend import (
     KernelBundle,
     extract_kernel_bundle,
     get_kernel_backend,
+    validate_musa_bundle_semantics,
 )
 from triton_kernel_agent.experience import (
     ExperienceRecord,
@@ -710,6 +711,9 @@ def kernel_function(*args, **kwargs):
                     raise ValueError(
                         "kernel.py is missing required kernel_function definition"
                     )
+                reason = validate_musa_bundle_semantics(bundle)
+                if reason:
+                    raise ValueError(reason)
             return bundle
         return self._extract_code_from_response(
             response_text,

@@ -33,6 +33,7 @@ from triton_kernel_agent.kernel_backend import (
     KernelBundle,
     extract_kernel_bundle,
     get_kernel_backend,
+    validate_musa_bundle_semantics,
 )
 from triton_kernel_agent.worker_util import format_test_code_for_llm
 from utils.providers import get_model_provider
@@ -126,6 +127,27 @@ DISALLOWED_TORCH_PATTERNS = [
         "locals() is not allowed in kernels; avoid depending on caller scopes",
     ),
 ]
+
+
+# ``torch.musa`` is a backend attribute created by ``import torch_musa``; it is
+# not an importable submodule, so ``import torch.musa`` / ``from torch.musa``
+# raise ModuleNotFoundError in generated tests. Normalize those statements to the
+# importable ``torch_musa`` package so the test also runs when executed directly.
+_MUSA_IMPORT_PATTERNS = (
+    (re.compile(r"^([ \t]*)import[ \t]+torch\.musa[ \t]*$", re.MULTILINE),
+     r"\1import torch_musa"),
+    (re.compile(r"^([ \t]*)import[ \t]+torch\.musa[ \t]+as[ \t]+([A-Za-z_]\w*)", re.MULTILINE),
+     r"\1import torch_musa as \2"),
+    (re.compile(r"^([ \t]*)from[ \t]+torch\.musa[ \t]+import[ \t]+", re.MULTILINE),
+     r"\1from torch_musa import "),
+)
+
+
+def normalize_musa_imports(source: str) -> str:
+    """Rewrite the invalid ``import torch.musa`` form to ``import torch_musa``."""
+    for pattern, replacement in _MUSA_IMPORT_PATTERNS:
+        source = pattern.sub(replacement, source)
+    return source
 
 
 class VerificationWorker:
@@ -288,6 +310,9 @@ class VerificationWorker:
             wrapper = kernel_code.files.get("kernel.py", "")
             if "def kernel_function" not in wrapper:
                 return "kernel.py is missing required kernel_function definition"
+            reason = validate_musa_bundle_semantics(kernel_code)
+            if reason:
+                return reason
             try:
                 for name, source in kernel_code.files.items():
                     if name.endswith(".py"):
@@ -362,9 +387,12 @@ class VerificationWorker:
         shutil.copy2(case_suite.__file__, self.workdir / "kernel_case_suite.py")
         shutil.copy2(kernel_call_binding.__file__, self.workdir / "kernel_call_binding.py")
         self.test_files = []
+        is_musa = self._kernel_backend.name == "musa"
         for i, code in enumerate(test_code):
             name = "test_kernel.py" if i == 0 else f"test_extra_{i}_kernel.py"
             path = self.workdir / name
+            if is_musa:
+                code = normalize_musa_imports(code)
             path.write_text(code)
             self.test_files.append(path)
         from .case_suite import SUITE_MARKER
@@ -398,6 +426,24 @@ class VerificationWorker:
             if pattern.search(sanitized):
                 return message
         return None
+
+    @staticmethod
+    def _failure_diagnostic(result: subprocess.CompletedProcess) -> str:
+        """Return the most actionable fragment of a failed test's real output.
+
+        When a suite companion test crashes before emitting its ``RESULT_PREFIX``
+        line (or emits no usable rows), the underlying process error (e.g. an
+        ImportError, ModuleNotFoundError, or a compiler traceback) is far more
+        actionable than a fixed placeholder string. Prefer the tail of stderr
+        (which carries Python/toolchain tracebacks), falling back to stdout, and
+        keep the fragment bounded so it fits into the refinement prompt.
+        """
+        fragment = (result.stderr or "").strip()
+        if not fragment:
+            fragment = (result.stdout or "").strip()
+        if not fragment:
+            return ""
+        return fragment[-2000:]
 
     def _run_test(self) -> tuple[bool, str, str]:
         """
@@ -448,14 +494,17 @@ class VerificationWorker:
                     if line.startswith(RESULT_PREFIX):
                         rows = json.loads(line[len(RESULT_PREFIX):])
                         if not isinstance(rows, list) or not rows:
-                            return False, result.stdout, "Explicit case report is empty or invalid"
+                            return False, result.stdout, self._failure_diagnostic(result) or (
+                                "Explicit case report is empty or invalid")
                         self.last_case_results = rows
                         self.logger.info("Explicit case coverage: %s", [(row["case_key"], row["status"]) for row in rows])
                         if any(row["status"] != "passed" for row in rows):
-                            return False, result.stdout, result.stderr or "An explicit test case failed or was missing"
+                            return False, result.stdout, self._failure_diagnostic(result) or (
+                                "An explicit test case failed or was missing")
                 from .case_suite import SUITE_MARKER
                 if SUITE_MARKER in test_file.read_text() and not self.last_case_results:
-                    return False, result.stdout, "Explicit case suite did not report coverage"
+                    return False, result.stdout, self._failure_diagnostic(result) or (
+                        "Explicit case suite did not report coverage")
                 if result.returncode != 0:
                     self.logger.error(
                         "Test %s failed. Exit code: %s, stdout: %s, stderr: %s",

@@ -72,6 +72,9 @@ You are generating a Triton kernel for Intel XPU (Xe GPUs). Follow these guideli
 _MUSA_GUIDANCE = """\
 **CRITICAL PLATFORM REQUIREMENTS FOR MUSA:**
 - Allocate tensors on device='musa', never device='cuda'.
+- Import the backend with exactly `import torch_musa`; never write
+  `import torch.musa` or `from torch.musa import ...` (torch.musa is an
+  attribute, not an importable submodule).
 - Use torch.musa for synchronization, events, and device properties.
 - Keep inputs, weights, intermediates, and outputs on the same MUSA device.
 - Do not monkey-patch torch.cuda or torch.device."""

@@ -192,3 +192,117 @@ def extract_kernel_bundle(response_text: str) -> KernelBundle | None:
             for name, content in matches
         }
     )
+
+
+# Builtin identifiers that MUSA/CUDA kernels may use, permitted only inside a
+# ``__global__`` kernel body (never in a host ``launch_*`` wrapper).
+_MUSA_DEVICE_BUILTIN_TOKENS = (
+    "blockIdx.", "blockDim.", "gridDim.", "threadIdx.",
+)
+_EXTENSION_NAME_RE = re.compile(r"name[ \t]*=[ \t]*['\"]([^'\"]+)['\"]")
+_RELATIVE_IMPORT_RE = re.compile(
+    r"^[ \t]*(?:from[ \t]+\.+|import[ \t]+\.)", re.MULTILINE
+)
+
+
+def validate_musa_bundle_semantics(bundle: KernelBundle) -> str | None:
+    """Cheap *content-semantic* checks for a Native MUSA bundle.
+
+    The structural checks (``require`` + ``def kernel_function`` presence) do
+    not catch bundle-glue mistakes that are fatal before or at compile time:
+
+    1. setup.py choosing the CUDA extension toolchain instead of torch_musa.
+    2. a MUSAExtension whose module name shadows the kernel.py wrapper (or the
+       module the wrapper imports), so ``from kernel import ...`` resolves to
+       the compiled ``.so`` instead of the wrapper.
+    3. a relative import in kernel.py, which fails when a bundle is run as a
+       top-level script.
+    4. MUSA/CUDA device builtins (``blockIdx.`` etc.) appearing inside host
+       ``launch_*`` functions rather than a ``__global__`` kernel body.
+
+    Returns ``None`` when the bundle looks semantically sound, otherwise a
+    human-readable reason describing the defect so the existing "repair the
+    complete format" flow can feed it back to the LLM.
+    """
+    setup_py = bundle.files.get("setup.py", "")
+    kernel_py = bundle.files.get("kernel.py", "")
+    binding_cpp = bundle.files.get("binding.cpp", "")
+    kernel_mu = bundle.files.get("kernel.mu", "")
+
+    # 1. Toolchain: native MUSA bundles must build with torch_musa.
+    if "torch.utils.cpp_extension" in setup_py or "cpp_extension import" in setup_py:
+        return (
+            "setup.py uses the CUDA extension toolchain "
+            "(torch.utils.cpp_extension) instead of "
+            "torch_musa.utils.musa_extension.{MUSAExtension, BuildExtension}; "
+            "mcc refuses kernel.mu files otherwise"
+        )
+    if "torch_musa.utils.musa_extension" not in setup_py:
+        return (
+            "setup.py must import torch_musa.utils.musa_extension "
+            "MUSAExtension/BuildExtension to compile this MUSA bundle"
+        )
+
+    # 2. Extension-name shadowing of the kernel.py wrapper.
+    # Only ``name == 'kernel'`` is genuinely fatal: the compiled extension is a
+    # module named ``kernel`` that shadows the wrapper *file* ``kernel.py``, so
+    # ``from kernel import kernel_function`` resolves to the extension (which
+    # does not export ``kernel_function``) instead of the Python wrapper. An
+    # extension whose name matches a module the wrapper imports is the normal,
+    # correct contract (the wrapper calls extension entry points), so it is
+    # deliberately NOT flagged here.
+    setup_names = set(_EXTENSION_NAME_RE.findall(setup_py))
+    for ext_name in setup_names:
+        if ext_name == "kernel":
+            return (
+                f"setup.py MUSAExtension name='kernel' shadows the kernel.py "
+                f"wrapper module: the built extension shadows kernel.py, so "
+                f"'from kernel import kernel_function' resolves to the compiled "
+                f"extension (which does not export kernel_function) instead of "
+                f"the wrapper"
+            )
+
+    # 3. Relative imports cannot work when a bundle runs as a top-level script.
+    if _RELATIVE_IMPORT_RE.search(kernel_py):
+        return (
+            "kernel.py uses a relative import (from . import ...), which fails "
+            "because the bundle runs as a top-level script with no parent "
+            "package; use an absolute import instead"
+        )
+
+    # 4. Device builtins belong inside a __global__ kernel body, not host glue.
+    # Scope is tracked with true brace depth: a kernel body opens at the first
+    # "{" seen at or after its "__global__" marker and closes only when that
+    # same braces level is closed. Inner blocks (for/if) merely change the
+    # running depth. The previous implementation treated every line starting
+    # with "}" as a possible kernel exit, so any builtin referenced after the
+    # first inner block of a __global__ kernel (the standard shared-memory
+    # reduction pattern) was falsely rejected as host code.
+    for source, filename in ((binding_cpp, "binding.cpp"), (kernel_mu, "kernel.mu")):
+        pending_global = False  # saw "__global__", waiting for its body "{"
+        global_base = None      # brace depth where the current kernel body lives
+        depth = 0               # running open-brace depth
+        for lineno, line in enumerate(source.splitlines(), start=1):
+            if global_base is None and not pending_global and "__global__" in line:
+                pending_global = True
+            opens = line.count("{")
+            closes = line.count("}")
+            if pending_global and opens:
+                # The first scope opened at/after a __global__ marker is the body.
+                global_base = depth + 1
+                pending_global = False
+            depth += opens - closes
+            if global_base is not None and depth < global_base:
+                global_base = None  # the kernel body closed on this line
+            if global_base is None and any(
+                tok in line for tok in _MUSA_DEVICE_BUILTIN_TOKENS
+            ):
+                offending = next(tok for tok in _MUSA_DEVICE_BUILTIN_TOKENS if tok in line)
+                return (
+                    f"{filename}:{lineno}: MUSA/CUDA device builtin "
+                    f"({offending.rstrip('.')}) appears outside any __global__ "
+                    f"kernel body (e.g. in host launch_* glue); move the "
+                    f"computation into a __global__ kernel function"
+                )
+
+    return None

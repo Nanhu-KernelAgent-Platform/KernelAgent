@@ -20,6 +20,27 @@ RESULT_PREFIX = "KERNELAGENT_CASE_RESULTS="
 SUITE_MARKER = "# KERNELAGENT_EXPLICIT_CASE_SUITE_V1"
 
 
+def register_torch_musa_alias():
+    """Make a bare ``import torch.musa`` valid on MUSA hosts.
+
+    ``torch_musa`` exposes the device API through the ``torch.musa`` *attribute*,
+    but it is not a real ``torch`` submodule, so generated tests that write
+    ``import torch.musa`` or ``from torch.musa import ...`` fail with
+    ``ModuleNotFoundError``. Importing the backend and registering it under
+    ``sys.modules['torch.musa']`` (plus the attribute) makes every form work.
+    No-op when torch_musa is unavailable (e.g. non-MUSA hosts).
+    """
+    try:
+        import torch_musa
+    except ImportError:
+        return
+    import sys
+    import torch
+    if not hasattr(torch, "musa"):
+        torch.musa = torch_musa
+    sys.modules.setdefault("torch.musa", torch_musa)
+
+
 def valid_samples(values, count=None):
     """Positive finite numeric windows; count stays explicit at each stage."""
     return bool(values) and (count is None or len(values) == count) and all(
@@ -36,7 +57,7 @@ def run_guarded_test(path, device="cpu"):
     import sys
     import torch
     if device == "musa":
-        import torch_musa  # noqa: F401
+        register_torch_musa_alias()
     owners = (torch, torch.Tensor, torch.testing, torch.autograd, torch.nn.functional)
     baseline = [(owner, name, value) for owner in owners
                 for name, value in vars(owner).items() if callable(value)]
@@ -174,7 +195,7 @@ def gradient_call(output, inputs, model, case):
 def prepare(problem, case, device, direction):
     import torch
     if str(device).split(":")[0] == "musa":
-        import torch_musa  # noqa: F401 - registers the private-use device backend
+        register_torch_musa_alias()
     torch.manual_seed(0)
     model = problem.Model(*case["init_inputs"]).to(device)
     inputs = move(case["inputs"], device, gradients=direction in {"backward", "joint"})
