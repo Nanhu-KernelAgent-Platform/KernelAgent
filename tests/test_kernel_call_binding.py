@@ -92,6 +92,20 @@ def test_binds_composite_kernel_state_to_named_submodules():
     )
 
 
+def test_missing_parameter_error_lists_available_model_values():
+    """Fix 3-1: refine feedback depends on the stable bindability error text."""
+    def kernel_function(x, dim):
+        return x, dim
+
+    with pytest.raises(KernelCallBindingError) as excinfo:
+        bind_kernel_call(kernel_function, FakeModel(), [object()])
+    message = str(excinfo.value)
+    assert "Cannot bind required kernel parameter(s): dim" in message
+    assert "available model values:" in message
+    assert "weight" in message
+    assert "stride" in message
+
+
 def test_numbered_submodule_alias_must_be_unambiguous():
     class Composite(FakeModel):
         def named_parameters(self):

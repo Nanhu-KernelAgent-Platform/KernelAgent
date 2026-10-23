@@ -18,12 +18,24 @@ Generate a correct, efficient native MUSA kernel for the following problem.
   runtime headers such as `<musa_runtime.h>`. CUDA-only headers (`<cuda.h>`,
   `<cuda_runtime.h>`) do not exist in this toolchain and abort the build; use
   them only when the target backend is CUDA, never in a MUSA file.
-- Evaluation call convention: `kernel_function` is called with exactly the
-  tensors returned by `get_inputs()`, positionally, in that order. Values from
-  `get_init_inputs()` (e.g. `dim`) are fixed at reference-model construction, so
-  bake them into kernel.py (module constant, closure, or `autograd.Function`
-  argument) instead of adding an extra required parameter — otherwise the
-  harness fails with "Cannot bind required kernel parameter(s)".
+- Evaluation call convention: every consumer (the generated test, the
+  deterministic case suite, and the KernelBench evaluator) invokes
+  `kernel_function` through `bind_kernel_call`, which resolves each parameter
+  in this priority: (1) BY NAME against the reference Model's state —
+  named_parameters()/named_buffers() leaf names (e.g. `weight`, `bias`;
+  aliases `w`, `gamma`, `beta`) and common module config attributes
+  (`stride`, `padding`, `dilation`, `output_padding`, `groups`, `eps`,
+  `num_groups`, `normalized_shape`, `kernel_size`); (2) otherwise POSITIONALLY
+  with the tensors returned by `get_inputs()`, in order; (3) parameters with
+  defaults are skipped. A required parameter that matches neither source fails
+  every consumer with "Cannot bind required kernel parameter(s): <name>".
+  Consequences you MUST follow: when the reference Model has
+  parameters/buffers (e.g. conv or norm weights), declare them as explicit
+  parameters named after the model state, e.g. `def kernel_function(x, weight,
+  bias)` — their values live in the model instance and cannot be baked in.
+  Values from `get_init_inputs()` (e.g. `dim`) are fixed at reference-model
+  construction, so bake them into kernel.py (module constant or closure)
+  instead of adding a required parameter.
 
 Return exactly four fenced FILE blocks and no prose: kernel.py, binding.cpp,
 kernel.mu, and setup.py.

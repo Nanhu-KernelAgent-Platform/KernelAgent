@@ -12,7 +12,9 @@ Generate a complete correctness test for a native MUSA kernel bundle.
 
 Requirements:
 - Return one complete fenced Python file and no prose.
-- Import `torch` and `torch_musa`, then import `kernel_function` from `kernel`.
+- Import `torch` and `torch_musa`, then import `kernel_function` from `kernel`,
+  and import `bind_kernel_call` (plus `move`) from `kernel_case_suite`. Emit
+  `import copy` whenever you use `copy.deepcopy`.
 - The test must be SELF-CONTAINED. Every single name the file references must be
   either imported by the file or defined at MODULE TOP LEVEL in the file. The
   test file is generated ONCE and reused for every repair round, so a missing
@@ -42,8 +44,23 @@ Requirements:
   not an importable submodule, so those forms raise
   `ModuleNotFoundError: No module named 'torch.musa'`. After `import torch_musa`
   only reference the API as `torch.musa.<function>(...)`.
-- Call kernel_function as a normal Python function. The native extension build
-  and launch details belong to kernel.py, binding.cpp, kernel.mu, and setup.py.
+- MANDATORY CALL BINDING: the test is generated BEFORE the kernel exists, so it
+  must NEVER hardcode a `kernel_function(...)` call signature. Import
+  `bind_kernel_call` from `kernel_case_suite` and route every native call site
+  through it, exactly like the deterministic case suite does:
+      from kernel_case_suite import bind_kernel_call
+      native_model = copy.deepcopy(ref_model)
+      invoke_native = bind_kernel_call(kernel_function, native_model, inputs_musa)
+      native_out = invoke_native()
+  `bind_kernel_call` binds model state (weight/bias and module config such as
+  stride/padding/groups) by name and the factory inputs positionally, so the
+  same test is correct for every legal kernel signature. Deep-copy the
+  reference model before binding so native-path parameter gradients never
+  land on the reference parameters (the case suite does the same). The test
+  receives the model only to source its state; the module itself is never
+  passed into kernel_function. A test that calls `kernel_function` directly
+  is rejected by validation. The extension build and launch details belong to
+  kernel.py, binding.cpp, kernel.mu, and setup.py.
 - When the problem defines `get_inputs()` or `get_init_inputs()`, reproduce those
   function definitions without changing their values, shapes, dtypes, seeds, or
   argument order, and CALL them to construct the correctness workload.
@@ -72,8 +89,10 @@ Requirements:
   the identical referenced constants.
 - Instantiate `Model(*get_init_inputs())` (or `Model()` only when the factory is
   absent/empty), then move the returned tensor inputs to MUSA without changing
-  non-tensor arguments. Pass the same logical inputs to the reference Model and
-  `kernel_function`; clone tensors when independent autograd state is required.
+  non-tensor arguments. Pass the same logical inputs to the reference Model
+  directly and to `kernel_function` via `bind_kernel_call(kernel_function,
+  model_copy, inputs)`; use independently moved tensors when independent
+  autograd state is required.
 - Do not replace the factory workload with hardcoded test tensors. Extra edge
   cases are allowed only after the shared factory workload passes.
 - Reproduce the exact forward semantics in the problem. Keep reference results

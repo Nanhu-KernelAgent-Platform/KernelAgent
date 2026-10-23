@@ -240,3 +240,83 @@ def validate_test_autograd(source: str) -> None:
                 leaf_tensors.update(branch_leaves)
 
     check_block(tree.body, set(), set(), set())
+
+
+def validate_test_kernel_call_binding(source: str) -> None:
+    """The main test is generated before the kernel, so it must not guess a signature.
+
+    Fix 3-1 (docs/design_kernelagent_fix_3-1_signature_contract_binding.md):
+    every consumer of ``kernel_function`` — the deterministic case suite, the
+    KernelBench evaluator, and the generated main test — resolves parameters
+    through ``bind_kernel_call`` (by name against the reference model's state,
+    then positionally from ``get_inputs()``). A hardcoded ``kernel_function(...)``
+    call in the main test is a guess about a signature that has not been
+    generated yet; P50/P56 burned full verification runs on exactly that
+    mismatch. Reject the direct call statically and require at least one
+    ``bind_kernel_call`` call site instead.
+    """
+    tree = ast.parse(source)
+
+    # Import alias resolution mirrors validate_kernel_globals' dotted() pattern:
+    # ``from kernel import kernel_function as kf`` and ``import kernel as k``
+    # both must resolve to "kernel.kernel_function".
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                aliases[item.asname or item.name.split(".")[0]] = (
+                    item.name if item.asname else item.name.split(".")[0]
+                )
+        elif isinstance(node, ast.ImportFrom):
+            for item in node.names:
+                aliases[item.asname or item.name] = (node.module or "") + "." + item.name
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return dotted(node.value) + "." + node.attr
+        return ""
+
+    KERNEL = "kernel.kernel_function"
+    BIND = "kernel_case_suite.bind_kernel_call"
+
+    def is_kernel_func(func):
+        if isinstance(func, ast.Name):
+            return func.id == "kernel_function" or aliases.get(func.id) == KERNEL
+        return dotted(func) == KERNEL
+
+    # An import of kernel_function already proves the test intends to exercise
+    # the kernel, so the bind-call requirement applies from that point on.
+    referenced_kernel = any(
+        isinstance(node, ast.ImportFrom) and node.module == "kernel"
+        and any((item.asname or item.name) == "kernel_function" for item in node.names)
+        for node in ast.walk(tree)
+    )
+    bind_calls = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if is_kernel_func(node.func):
+                raise ValueError(
+                    "Invalid correctness test: kernel_function must be invoked "
+                    "through bind_kernel_call(kernel_function, model_copy, inputs) "
+                    f"from kernel_case_suite, not called directly at line {node.lineno}; "
+                    "the test is generated before the kernel, so a hardcoded call "
+                    "signature is a guess that cannot be checked. "
+                    "Repair the test, not the kernel."
+                )
+            if dotted(node.func) == BIND:
+                # Only a properly imported bind_kernel_call counts as an
+                # invocation site; a bare unresolved call is a missing import
+                # and must fall through to the instructive error below.
+                bind_calls += 1
+        elif not referenced_kernel and (
+            is_kernel_func(node) if isinstance(node, (ast.Name, ast.Attribute)) else False
+        ):
+            referenced_kernel = True
+    if referenced_kernel and bind_calls == 0:
+        raise ValueError(
+            "Invalid correctness test: kernel_function is referenced but never "
+            "exercised; import bind_kernel_call from kernel_case_suite and route "
+            "the call through bind_kernel_call(kernel_function, model_copy, inputs)."
+        )

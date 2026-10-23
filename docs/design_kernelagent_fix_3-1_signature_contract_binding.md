@@ -1,6 +1,6 @@
 # KernelAgent 修复方案 3-1：kernel_function 调用契约统一 —— bind_kernel_call 单一事实源（设计备忘录）
 
-> 状态：**待审核（设计稿，未实施）**
+> 状态：**已实施 B1+B2（B3 二期暂缓，待授权后执行）**
 > 关联问题归类：**归类 3 —— 测试与 kernel 两个独立 LLM 生成物之间的隐式调用契约漂移**
 > （与归类 2 的区别：归类 2 是单个生成物自爆；归类 3 是两个各自合法的生成物互相不匹配）
 > 影响问题：KernelBench Level-1 的 **P50**（conv2D square，251min / 227k tokens，失败）、

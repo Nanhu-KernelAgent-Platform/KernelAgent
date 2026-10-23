@@ -25,9 +25,13 @@ GOOD_TEST = BAD_TEST.replace("torch.no_grad()", "torch.enable_grad()")
 
 
 def bundle_text(comment_headers=False):
+    # setup.py must satisfy validate_musa_bundle_semantics (fix 2-2): the
+    # MUSA toolchain import is mandatory, a CUDA cpp_extension import is
+    # rejected.
     files = {"kernel.py": "def kernel_function(x): return extension.forward(x)",
              "binding.cpp": "void launch();", "kernel.mu": "void launch() {}",
-             "setup.py": "from setuptools import setup"}
+             "setup.py": ("from torch_musa.utils.musa_extension import MUSAExtension, BuildExtension\n"
+                          "from setuptools import setup")}
     return "\n".join(
         (f"```\n{'#' if name.endswith('.py') else '//'} FILE: {name}\n{body}\n```"
          if comment_headers else f"FILE: {name}\n```\n{body}\n```")

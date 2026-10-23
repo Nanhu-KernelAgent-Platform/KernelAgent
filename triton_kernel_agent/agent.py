@@ -28,7 +28,11 @@ from dotenv import load_dotenv
 from .manager import WorkerManager
 from .experience.generation import generation_memory
 from .prompt_manager import PromptManager
-from .test_validation import validate_test_autograd, validate_test_layout
+from .test_validation import (
+    validate_test_autograd,
+    validate_test_kernel_call_binding,
+    validate_test_layout,
+)
 from .experience.signature import declared_execution_direction as _declared_execution_direction
 from utils.providers import BaseProvider, get_model_provider
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
@@ -394,6 +398,10 @@ class TritonKernelAgent:
                         validate_test_autograd(test_code)
                         if getattr(getattr(self, "_platform_config", None), "name", None) == "musa":
                             validate_test_layout(test_code)
+                            # Fix 3-1: the main test is generated before the
+                            # kernel, so it must stay signature-agnostic and go
+                            # through bind_kernel_call like every other consumer.
+                            validate_test_kernel_call_binding(test_code)
                         validate_generated_test_input_contract(
                             problem_description, test_code
                         )
