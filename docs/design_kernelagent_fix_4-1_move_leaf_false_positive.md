@@ -1,6 +1,7 @@
 # KernelAgent 修复方案 4-1：2-1 规则对 move() 派生叶子的误伤 —— 让静态规则认识自家搬运语义（设计备忘录）
 
-> 状态：**待审核（设计稿，未实施）**
+> 状态：**已实施 A1+A2+A3（含实施修订：`move_tensors` 两步式容器访问追踪，
+> 见 §4.1.3）**
 > 关联问题归类：**归类 4 —— 静态校验规则自身的假阳性（修复 2-1 引入的回归）**
 > （与归类 2 的区别：归类 2 是 LLM 生成物自爆、校验器正确拦截；归类 4 是生成物本身
 > 运行时合法、**校验器判死**——校验基础设施自己成了失败原因）
@@ -221,33 +222,62 @@ x.requires_grad = True
 保护只覆盖 torch/torch_musa 且只跑在 kernel.py 上，测试侧没有这层保护，
 必须在守卫里自理）。
 
-#### 4.1.3 `is_move_leaf(value)` 谓词
+#### 4.1.3 `is_move_leaf(value)` 谓词（实施修订：补两步式容器访问）
+
+设计稿伪代码只覆盖「直接下标链」`move(...)[0]`；实施时发现 P45 尝试 2 的
+真实形态是**两步式**：`inputs_ref = move(...)` 之后 `x_ref = inputs_ref[0]`
+（§2.2 表格第二行的形态）。仅识别直接链会漏掉它。最终实现增加一个与
+`leaf_tensors` 同样按作用域线程化追踪的名字集合 **`move_tensors`**
+（最新赋值为 move 派生值的名字），下标取自该集合的元素同样视为全新叶子：
 
 ```python
-def is_move_leaf(value):
-    # Subscript 链：move 递归映射 list/tuple/dict，元素仍是全新叶子
+def move_leaf(value, move_tensors):
+    if move_shadowed:
+        return False
     while isinstance(value, ast.Subscript):
         value = value.value
-    return (isinstance(value, ast.Call)
-            and dotted(value.func) == "kernel_case_suite.move")
+        if isinstance(value, ast.Name) and value.id in move_tensors:
+            return True          # inputs_ref = move(...); x = inputs_ref[0]
+    if not (isinstance(value, ast.Call)
+            and dotted(value.func) == "kernel_case_suite.move"):
+        return False
+    base = value.func
+    while isinstance(base, ast.Attribute):
+        base = base.value
+    return not (isinstance(base, ast.Name) and base.id in rebound)
 ```
 
 - ✅ `move(x.detach(), 'musa', gradients=True)` → Call → 叶子
 - ✅ `move(get_inputs(), 'musa')[0]` → Subscript(Call) → 叶子
 - ✅ 深层嵌套 `move(get_inputs(), 'musa')[0][1]` → 叶子（递归映射语义）
+- ✅ **两步式** `inputs_ref = move(...); x_ref = inputs_ref[0]` →
+  `move_tensors` 命中 → 叶子（P45 尝试 2 的真实形态）
 - ❌ `move(...)[0].clone()` → Attribute 包裹，不匹配 → 非叶子（链在方法
   调用处正确截断，派生张量继续被拒）
 - ❌ 别名被遮蔽后的本地 `move(...)` → 别名表无此键 → 非叶子
 
-#### 4.1.4 接入点一：叶子追踪（L216-221 一处改动）
+`move_tensors` 仅追踪 move 派生值，**不**扩展到 torch 工厂：对张量工厂
+`x = torch.randn(3)` 而言 `x[0]` 是视图，其叶子性取决于 `x.requires_grad`
+（基张量需要梯度时视图必为非叶子），语义与 move 的容器映射不同，且无失败
+证据，不动。
+
+#### 4.1.4 接入点一：叶子追踪（两处集合）
+
+`leaf_tensors` 之外同步维护 `move_tensors`（工厂值从 `move_tensors` 移出，
+move 派生值同时进入两个集合，其他赋值双双移出）；分支拷贝
+（if/else/try-except）与嵌套作用域对两个集合做同样的线程化处理。
 
 ```python
-moved = is_move_leaf(value)
+moved = move_leaf(value, move_tensors)
 ...
-if factory or moved:
-    leaf_tensors.add(t.id)
-else:
-    leaf_tensors.discard(t.id)
+for t in targets:
+    if isinstance(t, ast.Name):
+        if factory:
+            leaf_tensors.add(t.id); move_tensors.discard(t.id)
+        elif moved:
+            leaf_tensors.add(t.id); move_tensors.add(t.id)
+        else:
+            leaf_tensors.discard(t.id); move_tensors.discard(t.id)
 ```
 
 #### 4.1.5 接入点二：blocked/live 语义（move 结果是独立求导根）

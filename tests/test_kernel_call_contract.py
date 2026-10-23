@@ -185,6 +185,36 @@ def test_binding_validator_is_musa_scoped():
     assert agent._call_llm.call_count == 1
 
 
+def test_third_attempt_recovers_before_kernel_generation():
+    # Fix 4-1 A3: three attempts; the third fires only where the previous
+    # behavior hard-failed the whole problem (P47 wasted attempt 1 on a
+    # no-code response and attempt 2 on a validation false positive).
+    agent = make_agent(get_platform("musa"))
+    agent._call_llm = Mock(side_effect=[DIRECT_CALL_TEST, DIRECT_CALL_TEST, BIND_PATTERN_TEST])
+    assert agent._generate_test("formula") == BIND_PATTERN_TEST
+    assert agent._call_llm.call_count == 3
+
+
+def test_three_failed_attempts_raise_the_last_contract_error():
+    agent = make_agent(get_platform("musa"))
+    agent._call_llm = Mock(side_effect=[DIRECT_CALL_TEST, DIRECT_CALL_TEST, DIRECT_CALL_TEST])
+    with pytest.raises(ValueError, match="not called directly"):
+        agent._generate_test("formula")
+    assert agent._call_llm.call_count == 3
+
+
+def test_repair_message_carries_the_legal_leaf_pattern():
+    # Fix 4-1 A2: the repair prompt must teach the concrete move() pattern
+    # instead of the misleading torch.randn-only advice (P45/P47 evidence).
+    agent = make_agent(get_platform("musa"))
+    agent._call_llm = Mock(side_effect=[DIRECT_CALL_TEST, BIND_PATTERN_TEST])
+    agent._generate_test("formula")
+    repair_message = agent._call_llm.call_args.args[0][-1]["content"]
+    assert "move(tensor.detach(), device, gradients=True)" in repair_message
+    assert "kernel_case_suite" in repair_message
+    assert ".requires_grad_()" in repair_message
+
+
 def musa_manager():
     return PromptManager(target_platform=get_platform("musa"), kernel_backend="musa")
 

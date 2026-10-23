@@ -94,9 +94,24 @@ def validate_test_autograd(source: str) -> None:
     except SyntaxError as exc:
         raise ValueError(f"Invalid correctness test: invalid Python: {exc}") from exc
 
+    # Fix 4-1: import alias resolution so the grad-mode checks and the 2-1
+    # leaf rule see through ``import torch as t`` and
+    # ``from kernel_case_suite import move as mv`` (mirrors
+    # validate_kernel_globals' dotted()). Later imports win, matching the
+    # runtime rebinding semantics of Python.
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                aliases[item.asname or item.name.split(".")[0]] = (
+                    item.name if item.asname else item.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for item in node.names:
+                aliases[item.asname or item.name] = (node.module or "") + "." + item.name
+
     def dotted(node):
         if isinstance(node, ast.Name):
-            return node.id
+            return aliases.get(node.id, node.id)
         if isinstance(node, ast.Attribute):
             return dotted(node.value) + "." + node.attr
         return ""
@@ -124,13 +139,59 @@ def validate_test_autograd(source: str) -> None:
         "torch.arange", "torch.tensor",
     }
 
-    def check_block(statements, blocked, live, leaf_tensors, disabled=False):
+    # Fix 4-1: the suite's move() always returns fresh leaf tensors
+    # (case_suite.py: empty_strided allocation + no_grad copy_ +
+    # requires_grad_()), and maps list/tuple/dict recursively, so every
+    # element is also a fresh leaf. A locally rebound name (def move /
+    # move = ...) or a module attribute rebind (kernel_case_suite.move =
+    # ...) voids that guarantee: the name may run arbitrary user code, so
+    # recognition must fail closed. Tests are not covered by
+    # validate_kernel_globals' framework-patch protection (that runs on
+    # kernel.py and protects only torch/torch_musa), hence the guard here.
+    MOVE = "kernel_case_suite.move"
+    rebound = set()
+    move_shadowed = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            rebound.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and dotted(target) == MOVE:
+                    move_shadowed = True
+                rebound.update(
+                    n.id for n in ast.walk(target) if isinstance(n, ast.Name))
+
+    def move_leaf(value, move_tensors):
+        """True when ``value`` is a fresh-leaf-producing suite move() result.
+
+        Covers the direct call, subscript chains over the call (move maps
+        containers recursively), and subscripting a name previously bound to
+        a move() result (``inputs = move(...); x = inputs[0]``) -- the
+        P45 attempt-2 form. The chain stops at anything that is not a
+        subscript or the move call itself: ``move(...)[0].clone()`` is a
+        derived tensor and stays rejected.
+        """
+        if move_shadowed:
+            return False
+        while isinstance(value, ast.Subscript):
+            value = value.value
+            if isinstance(value, ast.Name) and value.id in move_tensors:
+                return True
+        if not (isinstance(value, ast.Call) and dotted(value.func) == MOVE):
+            return False
+        base = value.func
+        while isinstance(base, ast.Attribute):
+            base = base.value
+        return not (isinstance(base, ast.Name) and base.id in rebound)
+
+    def check_block(statements, blocked, live, leaf_tensors, move_tensors, disabled=False):
         for stmt in statements:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                check_block(stmt.body, set(), set(), set())
+                check_block(stmt.body, set(), set(), set(), set())
                 continue
             if isinstance(stmt, ast.ClassDef):
-                check_block(stmt.body, set(), set(), set())
+                check_block(stmt.body, set(), set(), set(), set())
                 continue
             if isinstance(stmt, (ast.With, ast.AsyncWith)):
                 mode = disabled
@@ -142,7 +203,7 @@ def validate_test_autograd(source: str) -> None:
                             mode = True
                         elif name == "torch.enable_grad":
                             mode = False
-                check_block(stmt.body, blocked, live, leaf_tensors, mode)
+                check_block(stmt.body, blocked, live, leaf_tensors, move_tensors, mode)
                 continue
             # Scan this statement's expressions, not nested function/control bodies.
             expressions = [child for child in ast.iter_child_nodes(stmt)
@@ -170,7 +231,9 @@ def validate_test_autograd(source: str) -> None:
                 if value is not None:
                     targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
                     # 2-1 rule: reject ``X.requires_grad = True`` when ``X`` has not
-                    # been created as a fresh torch-factory leaf tensor.
+                    # been created as a fresh leaf tensor (torch factory or a
+                    # kernel_case_suite.move() result, which always returns
+                    # fresh leaves -- fix 4-1).
                     for t in targets:
                         if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
                                 and t.attr == "requires_grad"
@@ -178,11 +241,14 @@ def validate_test_autograd(source: str) -> None:
                                 and t.value.id not in leaf_tensors):
                             raise ValueError(
                                 "Invalid correctness test: only a fresh leaf tensor "
-                                "(e.g. torch.randn(...), or a factory with "
-                                "requires_grad=True) may have .requires_grad set to True, "
-                                f"not a derived tensor at line {t.lineno}. A value such as "
-                                ".clone() is not a leaf and fails at runtime; "
-                                "repair the test, not the kernel."
+                                "(a torch factory result, or a move(...) result from "
+                                "kernel_case_suite, which always returns fresh leaf "
+                                "tensors) may have .requires_grad set to True, not a "
+                                f"derived tensor at line {t.lineno}. A value such as "
+                                ".clone() is not a leaf and fails at runtime; to "
+                                "enable grad on an existing fresh leaf, call "
+                                ".requires_grad_() instead of assigning the attribute. "
+                                "Repair the test, not the kernel."
                             )
                     names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
                     value_dependencies = dependencies(value)
@@ -193,12 +259,16 @@ def validate_test_autograd(source: str) -> None:
                             and (not value.args or not isinstance(value.args[0], ast.Constant)
                                  or value.args[0].value is True))
                     factory = (isinstance(value, ast.Call) and dotted(value.func) in FACTORY_CALLS)
+                    moved = move_leaf(value, move_tensors)
                     factory_grad = factory and any(
                         k.arg == "requires_grad" and isinstance(k.value, ast.Constant)
                         and k.value.value is True for k in value.keywords)
                     # Detached targets in an otherwise differentiable loss are legal.
                     # Recognized factories also do not inherit their template's graph.
-                    if not leaf and not factory and (
+                    # A move() result is a fresh differentiation root: its copy_ runs
+                    # under no_grad, so gradients never flow back to the source and it
+                    # must never inherit "blocked" status (fix 4-1).
+                    if not leaf and not factory and not moved and (
                         disabled or (value_dependencies & blocked and not value_dependencies & live)
                     ):
                         blocked.update(names)
@@ -212,13 +282,20 @@ def validate_test_autograd(source: str) -> None:
                         else:
                             live.difference_update(names)
                     # Track leaf status for the 2-1 rule: a plain name assigned a
-                    # torch-factory value is a leaf; any other assignment revokes it.
+                    # torch-factory or move()-derived value is a leaf; any other
+                    # assignment revokes it. move()-derived names are tracked
+                    # separately so their container elements count as leaves too.
                     for t in targets:
                         if isinstance(t, ast.Name):
                             if factory:
                                 leaf_tensors.add(t.id)
+                                move_tensors.discard(t.id)
+                            elif moved:
+                                leaf_tensors.add(t.id)
+                                move_tensors.add(t.id)
                             else:
                                 leaf_tensors.discard(t.id)
+                                move_tensors.discard(t.id)
             # Branch-local assignments must not erase another possible blocked path.
             for field in ("body", "orelse", "finalbody"):
                 body = getattr(stmt, field, None)
@@ -226,20 +303,26 @@ def validate_test_autograd(source: str) -> None:
                     branch = set(blocked)
                     branch_live = set(live)
                     branch_leaves = set(leaf_tensors)
-                    check_block(body, branch, branch_live, branch_leaves, disabled)
+                    branch_moved = set(move_tensors)
+                    check_block(body, branch, branch_live, branch_leaves,
+                                branch_moved, disabled)
                     blocked.update(branch)
                     live.intersection_update(branch_live)
                     leaf_tensors.update(branch_leaves)
+                    move_tensors.update(branch_moved)
             for handler in getattr(stmt, "handlers", []):
                 branch = set(blocked)
                 branch_live = set(live)
                 branch_leaves = set(leaf_tensors)
-                check_block(handler.body, branch, branch_live, branch_leaves, disabled)
+                branch_moved = set(move_tensors)
+                check_block(handler.body, branch, branch_live, branch_leaves,
+                            branch_moved, disabled)
                 blocked.update(branch)
                 live.intersection_update(branch_live)
                 leaf_tensors.update(branch_leaves)
+                move_tensors.update(branch_moved)
 
-    check_block(tree.body, set(), set(), set())
+    check_block(tree.body, set(), set(), set(), set())
 
 
 def validate_test_kernel_call_binding(source: str) -> None:

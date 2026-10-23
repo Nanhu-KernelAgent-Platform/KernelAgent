@@ -238,7 +238,8 @@ def test_invalid_test_repair_is_bounded():
     agent._extract_code_from_response = lambda text: text
     with pytest.raises(ValueError, match="Invalid correctness test"):
         agent._generate_test("formula")
-    assert agent._call_llm.call_count == 2
+    # Fix 4-1 A3: the repair loop is bounded at three attempts.
+    assert agent._call_llm.call_count == 3
 
 
 def test_missing_provider_never_falls_back_to_mock_correctness_test():

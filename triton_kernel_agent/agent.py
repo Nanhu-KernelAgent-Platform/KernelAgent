@@ -382,10 +382,12 @@ class TritonKernelAgent:
                 provided_test_code=provided_test_code,
             )
 
-            # Call the LLM, with one focused repair attempt if it changes or skips
-            # the shared benchmark input factories.
+            # Call the LLM, with focused repair attempts if it changes or skips
+            # the shared benchmark input factories. Fix 4-1 A3: three attempts;
+            # the third fires only where the previous behavior hard-failed the
+            # whole problem.
             messages = [{"role": "user", "content": prompt}]
-            for attempt in range(2):
+            for attempt in range(3):
                 response_text = self._call_llm(messages, max_tokens=24000)
                 self.logger.info("Raw test generation response:\n%s", response_text)
                 test_code = self._extract_code_from_response(response_text)
@@ -412,10 +414,12 @@ class TritonKernelAgent:
                             f"Successfully generated test code using {self.model_name}"
                         )
                         return test_code
-                if attempt == 1:
+                if attempt == 2:
                     raise contract_error
                 self.logger.warning(
-                    "Generated test failed validity/contract checks; retrying once: %s",
+                    "Generated test failed validity/contract checks; "
+                    "retry %d/2: %s",
+                    attempt + 1,
                     contract_error,
                 )
                 messages.extend(
@@ -430,7 +434,13 @@ class TritonKernelAgent:
                                 "complete fenced Python test. Preserve the reference "
                                 "semantics and all cases/tolerances. For backward, "
                                 "recompute the reference with grad enabled and independent "
-                                "leaf inputs; do not differentiate a no_grad result."
+                                "leaf inputs; do not differentiate a no_grad result. "
+                                # Fix 4-1 A2: the concrete legal leaf pattern.
+                                "Build independent leaf inputs with "
+                                "move(tensor.detach(), device, gradients=True) from "
+                                "kernel_case_suite — the result is already a fresh "
+                                "leaf, so never assign .requires_grad afterwards; "
+                                "call .requires_grad_() on a fresh leaf instead if needed."
                             ),
                         },
                     ]
