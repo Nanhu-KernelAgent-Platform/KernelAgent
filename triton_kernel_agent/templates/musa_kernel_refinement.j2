@@ -49,3 +49,14 @@ FILE blocks. Put each literal FILE: filename header outside and immediately
 before its code fence. Return no prose and never copy reference Models, input
 factories or tests into kernel.py. Do not repair a reference-test setup error by
 changing native arithmetic; preserve all test semantics and tolerances.
+
+Output budget: the whole reply must stay under 13000 tokens; the server
+truncates anything longer and the run fails.
+
+- Start your reply directly at the first "FILE:" header. Do NOT open with an
+  explanation of what you changed: the failure and the diff intent are already
+  described above, and restating them costs the budget the fix needs.
+- Keep comments minimal (<= 5 comment lines per file).
+- Do not add dtype instantiations the test file does not exercise.
+- Keep setup.py as-is from the previous bundle unless the build itself must
+  change.

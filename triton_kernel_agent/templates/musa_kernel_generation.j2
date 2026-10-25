@@ -40,6 +40,32 @@ Generate a correct, efficient native MUSA kernel for the following problem.
 Return exactly four fenced FILE blocks and no prose: kernel.py, binding.cpp,
 kernel.mu, and setup.py.
 
+Output budget: the whole reply must stay under 13000 tokens; the server
+truncates anything longer and the run fails. To fit:
+
+1. Your reply starts at the "F" of the first "FILE:" header. No reasoning,
+   no plan, no restatement of the problem, before or after the blocks.
+2. Comments: at most one short header comment per file (<= 5 comment lines
+   total per file). The code itself is the deliverable.
+3. Instantiate only the dtypes the test file actually exercises. Do NOT add
+   float64 support "just in case": extra dtype instantiations are dead code
+   that burns the output budget and verification never exercises them.
+4. setup.py: copy the canonical shape below, changing only the extension
+   name. Do not hand-write a longer variant.
+
+Canonical setup.py (<= 20 lines, adapt name/sources only):
+```python
+from setuptools import setup
+from torch_musa.utils.musa_extension import MUSAExtension, BuildExtension
+
+setup(
+    name="<extension name>",
+    ext_modules=[MUSAExtension(name="<extension name>",
+                               sources=["binding.cpp", "kernel.mu"])],
+    cmdclass={"build_ext": BuildExtension},
+)
+```
+
 Use these literal headers, in this order, without Markdown heading prefixes or
 backticks around filenames:
 FILE: kernel.py
