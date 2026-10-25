@@ -12,6 +12,15 @@ Generate a complete correctness test for a native MUSA kernel bundle.
 
 Requirements:
 - Return one complete fenced Python file and no prose.
+{% if forward_only %}
+- FORWARD-ONLY CONTRACT: this benchmark scores the forward output only. Verify
+  ONLY the forward result. Do NOT call `.backward()`, `torch.autograd.grad`,
+  `torch.autograd.backward` or pass `grad_outputs`/`gradients` anywhere, and do
+  NOT compare gradients. A test containing any backward/grad step is rejected
+  before it runs. Inputs therefore need no `requires_grad` and no leaf-tensor
+  setup; clone inputs only to give the reference and the kernel independent
+  tensors.
+{% endif %}
 - Import `torch` and `torch_musa`, then import `kernel_function` from `kernel`,
   and import `bind_kernel_call` (plus `move`) from `kernel_case_suite`. Emit
   `import copy` whenever you use `copy.deepcopy`.
@@ -103,6 +112,10 @@ Requirements:
 - On failure, print useful shape/dtype/error details and exit nonzero.
 - Do not pass a reference model or precomputed expected output to
   kernel_function.
+{% if forward_only %}
+- The reference comparison runs under `torch.no_grad()`; compare numeric
+  forward outputs (assert_close / allclose) and nothing else.
+{% else %}
 - For training/backward, recompute reference outputs with torch.enable_grad().
   Never call backward/autograd.grad on a reference evaluated under no_grad or
   inference_mode. A no_grad forward-only comparison is fine, but its output
@@ -116,5 +129,6 @@ Requirements:
 - Distinguish a reference-test/autograd setup failure from a native numerical
   mismatch. Do not mask errors, skip backward, loosen tolerances, or print PASS
   just because forward passed.
+{% endif %}
 
 Generate the test now.

@@ -197,7 +197,10 @@ class PromptManager:
                     self.templates[template_name] = self.env.get_template(template_file)
 
     def render_test_generation_prompt(
-        self, problem_description: str, provided_test_code: str | None = None
+        self,
+        problem_description: str,
+        provided_test_code: str | None = None,
+        verify_direction: str | None = None,
     ) -> str:
         """
         Render the test generation prompt.
@@ -205,6 +208,9 @@ class PromptManager:
         Args:
             problem_description: Description of the problem to generate tests for
             provided_test_code: Optional reference test code provided by user
+            verify_direction: Optional explicit verification contract.
+                ``forward`` renders the forward-only variant used by KernelBench
+                scoring (no backward/gradient comparison).
 
         Returns:
             Rendered prompt string
@@ -214,6 +220,8 @@ class PromptManager:
             problem_description=problem_description,
             provided_test_code=provided_test_code,
             device_string=self.target_platform.device_string,
+            verify_direction=verify_direction,
+            forward_only=verify_direction == "forward",
         )
 
     def render_kernel_generation_prompt(

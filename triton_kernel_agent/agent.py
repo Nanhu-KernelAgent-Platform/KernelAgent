@@ -29,12 +29,22 @@ from .manager import WorkerManager
 from .experience.generation import generation_memory
 from .prompt_manager import PromptManager
 from .test_validation import (
+    validate_forward_only_test,
     validate_test_autograd,
     validate_test_kernel_call_binding,
     validate_test_layout,
 )
+from .verification_policy import is_forward_only, resolve_verify_direction
 from .experience.signature import declared_execution_direction as _declared_execution_direction
+from .llm_truncation import (
+    CONTINUATION_PROMPT,
+    LLMCallResult,
+    MAX_CONTINUATIONS,
+    TRUNCATION_MARGIN_TOKENS,
+    looks_truncated,
+)
 from utils.providers import BaseProvider, get_model_provider
+from utils.providers.base import resolve_output_cap
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
 from triton_kernel_agent.kernel_backend import (
@@ -43,6 +53,7 @@ from triton_kernel_agent.kernel_backend import (
     get_kernel_backend,
     validate_musa_bundle_semantics,
 )
+from triton_kernel_agent.kernel_call_binding import kernel_signature_bindability
 from triton_kernel_agent.experience import (
     ExperienceRecord,
     SQLiteExperienceStore,
@@ -352,8 +363,38 @@ class TritonKernelAgent:
         response = self.provider.get_response(self.model_name, messages, **kwargs)
         return response.content
 
+    def _call_llm_detailed(self, messages: list, **kwargs) -> LLMCallResult:
+        """Like ``_call_llm`` but surfaces the truncation-detection signals.
+
+        The seed path needs ``completion_tokens`` / ``finish_reason`` to tell a
+        malformed response that was cut at the output cap (continue it) from
+        one that is simply wrong (repair it). Without that distinction a seed
+        truncated mid-bundle was "repaired" by regenerating everything under
+        the same cap and truncated again.
+        """
+        if not self.provider:
+            raise RuntimeError(f"No provider available for model {self.model_name}")
+
+        if getattr(self, "high_reasoning_effort", False):
+            kwargs["high_reasoning_effort"] = True
+
+        response = self.provider.get_response(self.model_name, messages, **kwargs)
+        completion_tokens = None
+        if isinstance(response.usage, dict):
+            raw = response.usage.get("completion_tokens")
+            if isinstance(raw, int):
+                completion_tokens = raw
+        return LLMCallResult(
+            content=response.content,
+            completion_tokens=completion_tokens,
+            finish_reason=getattr(response, "finish_reason", None),
+        )
+
     def _generate_test(
-        self, problem_description: str, provided_test_code: str | None = None
+        self,
+        problem_description: str,
+        provided_test_code: str | None = None,
+        verify_direction: str | None = None,
     ) -> str:
         """
         Generate test code for the problem using OpenAI API.
@@ -364,6 +405,9 @@ class TritonKernelAgent:
         Args:
             problem_description: Description of the problem
             provided_test_code: Optional reference test code provided by user
+            verify_direction: Optional verification contract. ``forward`` renders
+                the forward-only prompt used by KernelBench scoring (no backward
+                or gradient comparison) and rejects leftover grad checks.
 
         Returns:
             Generated test code in standardized format
@@ -380,6 +424,7 @@ class TritonKernelAgent:
             prompt = self.prompt_manager.render_test_generation_prompt(
                 problem_description=problem_description,
                 provided_test_code=provided_test_code,
+                verify_direction=verify_direction,
             )
 
             # Call the LLM, with focused repair attempts if it changes or skips
@@ -387,8 +432,15 @@ class TritonKernelAgent:
             # the third fires only where the previous behavior hard-failed the
             # whole problem.
             messages = [{"role": "user", "content": prompt}]
-            for attempt in range(3):
-                response_text = self._call_llm(messages, max_tokens=24000)
+            attempts = 3
+            for attempt in range(attempts):
+                # Fix 6-2: request the model's resolved budget so the ask and
+                # the server cap agree (a literal larger than the cap makes the
+                # usage readout and the truncation threshold disagree).
+                response_text = self._call_llm(
+                    messages,
+                    max_tokens=resolve_output_cap(self.model_name, self.provider),
+                )
                 self.logger.info("Raw test generation response:\n%s", response_text)
                 test_code = self._extract_code_from_response(response_text)
                 if not test_code:
@@ -397,6 +449,11 @@ class TritonKernelAgent:
                     )
                 else:
                     try:
+                        if is_forward_only(verify_direction):
+                            # KernelBench scores forward output only: a leftover
+                            # training-style grad check is a contract failure, not
+                            # a kernel defect, so reject it before it runs.
+                            validate_forward_only_test(test_code)
                         validate_test_autograd(test_code)
                         if getattr(getattr(self, "_platform_config", None), "name", None) == "musa":
                             validate_test_layout(test_code)
@@ -414,12 +471,13 @@ class TritonKernelAgent:
                             f"Successfully generated test code using {self.model_name}"
                         )
                         return test_code
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise contract_error
                 self.logger.warning(
                     "Generated test failed validity/contract checks; "
-                    "retry %d/2: %s",
+                    "retrying after attempt %d/%d: %s",
                     attempt + 1,
+                    attempts,
                     contract_error,
                 )
                 messages.extend(
@@ -432,15 +490,24 @@ class TritonKernelAgent:
                                 "Copy get_inputs() and get_init_inputs() exactly from "
                                 "Describe2 and call both factories. Return only the "
                                 "complete fenced Python test. Preserve the reference "
-                                "semantics and all cases/tolerances. For backward, "
-                                "recompute the reference with grad enabled and independent "
-                                "leaf inputs; do not differentiate a no_grad result. "
-                                # Fix 4-1 A2: the concrete legal leaf pattern.
-                                "Build independent leaf inputs with "
-                                "move(tensor.detach(), device, gradients=True) from "
-                                "kernel_case_suite — the result is already a fresh "
-                                "leaf, so never assign .requires_grad afterwards; "
-                                "call .requires_grad_() on a fresh leaf instead if needed."
+                                "semantics and all cases/tolerances. "
+                                + (
+                                    "FORWARD-ONLY: compare forward outputs only. Remove "
+                                    "every .backward()/torch.autograd.grad call and every "
+                                    "grad_outputs/gradients argument; no leaf-tensor or "
+                                    "requires_grad setup is needed."
+                                    if is_forward_only(verify_direction)
+                                    else
+                                    "For backward, recompute the reference with grad "
+                                    "enabled and independent leaf inputs; do not "
+                                    "differentiate a no_grad result. "
+                                    # Fix 4-1 A2: the concrete legal leaf pattern.
+                                    "Build independent leaf inputs with "
+                                    "move(tensor.detach(), device, gradients=True) from "
+                                    "kernel_case_suite — the result is already a fresh "
+                                    "leaf, so never assign .requires_grad afterwards; "
+                                    "call .requires_grad_() on a fresh leaf instead if needed."
+                                )
                             ),
                         },
                     ]
@@ -528,11 +595,13 @@ class TritonKernelAgent:
 
                 kernels = []
                 messages = [{"role": "user", "content": prompt}]
-                invalid_musa_responses: list[tuple[int, str]] = []
+                invalid_musa_responses: list[tuple[int, str, str]] = []
 
                 def extract_seed(response_text: str, seed_index: int, label: str):
                     try:
-                        payload = self._extract_kernel_payload(response_text)
+                        payload = self._extract_kernel_payload(
+                            response_text, problem_description
+                        )
                         # _extract_kernel_payload returns None (rather than
                         # raising) when no FILE block is recognized at all, e.g.
                         # when the model spent its entire budget before emitting
@@ -559,11 +628,71 @@ class TritonKernelAgent:
                             recognized,
                             saved_path or "(response log directory unavailable)",
                         )
-                        invalid_musa_responses.append((seed_index, response_text))
+                        invalid_musa_responses.append((seed_index, response_text, str(exc)))
                         return None
 
                 # Use provider's multiple response capability
-                max_completion_tokens = 20000
+                # Fix 1+4: request the model's resolved output budget instead of
+                # a hardcoded 20000, and continue truncated seeds instead of
+                # regenerating them under the same cap.
+                max_completion_tokens = resolve_output_cap(self.model_name, self.provider)
+                truncation_threshold = max_completion_tokens - TRUNCATION_MARGIN_TOKENS
+
+                def continue_truncated_seed(
+                    seed_index: int,
+                    first: LLMCallResult,
+                ):
+                    """Continue a seed cut at the output cap, then extract it.
+
+                    Returns the extracted payload, or None when the response is
+                    malformed for a reason other than truncation (or the
+                    continuation budget is exhausted). The original text is
+                    extended verbatim: the model is told to emit only the
+                    remainder, so concatenation restores the full bundle.
+                    """
+                    text = first.content
+                    result = first
+                    label = f"seed_{seed_index}_invalid_response"
+                    payload = extract_seed(text, seed_index, label)
+                    if payload is not None:
+                        return payload
+                    reason = invalid_musa_responses[-1][2]
+                    for cont in range(MAX_CONTINUATIONS):
+                        if not looks_truncated(result, reason, truncation_threshold):
+                            break
+                        self.logger.info(
+                            "Kernel seed %d was cut at the output cap "
+                            "(completion_tokens=%s, finish_reason=%s); requesting "
+                            "continuation %d/%d",
+                            seed_index,
+                            result.completion_tokens,
+                            result.finish_reason,
+                            cont + 1,
+                            MAX_CONTINUATIONS,
+                        )
+                        thread = [
+                            *messages,
+                            {"role": "assistant", "content": text},
+                            {"role": "user", "content": CONTINUATION_PROMPT},
+                        ]
+                        segment = self._call_llm_detailed(
+                            thread,
+                            max_tokens=max_completion_tokens,
+                            temperature=0.2,
+                        )
+                        if not segment.content or not segment.content.strip():
+                            break
+                        text = text + segment.content
+                        result = segment
+                        payload = extract_seed(
+                            text,
+                            seed_index,
+                            f"seed_{seed_index}_continuation_{cont + 1}_invalid_response",
+                        )
+                        if payload is not None:
+                            return payload
+                        reason = invalid_musa_responses[-1][2]
+                    return None
 
                 if self.provider.supports_multiple_completions():
                     # Provider supports native multiple completions
@@ -577,9 +706,18 @@ class TritonKernelAgent:
                     )
 
                     for i, response in enumerate(responses):
-                        kernel_code = extract_seed(
-                            response.content, i, f"seed_{i}_invalid_response"
+                        usage = response.usage if isinstance(response.usage, dict) else {}
+                        completion_tokens = usage.get("completion_tokens")
+                        first = LLMCallResult(
+                            content=response.content,
+                            completion_tokens=(
+                                completion_tokens
+                                if isinstance(completion_tokens, int)
+                                else None
+                            ),
+                            finish_reason=getattr(response, "finish_reason", None),
                         )
+                        kernel_code = continue_truncated_seed(i, first)
                         if kernel_code:
                             kernels.append(kernel_code)
                         else:
@@ -592,14 +730,12 @@ class TritonKernelAgent:
                 else:
                     # Provider doesn't support multiple completions, make individual calls
                     for i in range(num_seeds):
-                        response_text = self._call_llm(
+                        first = self._call_llm_detailed(
                             messages,
                             max_tokens=max_completion_tokens,
                             temperature=0.8 + (i * 0.1),
                         )
-                        kernel_code = extract_seed(
-                            response_text, i, f"seed_{i}_invalid_response"
-                        )
+                        kernel_code = continue_truncated_seed(i, first)
 
                         if kernel_code:
                             kernels.append(kernel_code)
@@ -619,7 +755,7 @@ class TritonKernelAgent:
                     # retry often truncates again. Retry the complete-format
                     # repair a bounded number of times before giving up.
                     for attempt in range(1, MUSA_SEED_REPAIR_ATTEMPTS + 1):
-                        seed_index, invalid_response = invalid_musa_responses[-1]
+                        seed_index, invalid_response, reason = invalid_musa_responses[-1]
                         self.logger.info(
                             "Requesting complete-format repair %d/%d for MUSA kernel seed %d",
                             attempt,
@@ -632,13 +768,15 @@ class TritonKernelAgent:
                             {
                                 "role": "user",
                                 "content": (
-                                    "Regenerate the complete native MUSA bundle. The prior "
-                                    "answer was incomplete or used unsupported file headers. "
-                                    "Return all four files with the literal headers "
-                                    "FILE: kernel.py, FILE: binding.cpp, FILE: kernel.mu, and "
-                                    "FILE: setup.py. Put each header immediately before its "
-                                    "fenced code block and return no prose. Do not deliberate: "
-                                    "emit the four files directly."
+                                    "Your previously submitted MUSA bundle was REJECTED "
+                                    "for this exact reason:\n\n"
+                                    + f"{reason}\n\n"
+                                    + "Fix precisely that defect and regenerate the complete "
+                                    "native MUSA bundle (kernel.py, binding.cpp, kernel.mu, "
+                                    "setup.py), each header literally 'FILE: <name>' immediately "
+                                    "before its fenced code block. Do NOT reproduce the rejected "
+                                    "construct named above. Return no prose, no reasoning, no "
+                                    "markdown outside the four FILE blocks."
                                 ),
                             },
                         ]
@@ -712,7 +850,9 @@ def kernel_function(*args, **kwargs):
 
         return kernels
 
-    def _extract_kernel_payload(self, response_text: str) -> str | KernelBundle | None:
+    def _extract_kernel_payload(
+        self, response_text: str, problem_description: str = ""
+    ) -> str | KernelBundle | None:
         if self._kernel_backend.name == "musa":
             bundle = extract_kernel_bundle(response_text)
             if bundle is not None:
@@ -732,6 +872,15 @@ def kernel_function(*args, **kwargs):
                 reason = validate_musa_bundle_semantics(bundle)
                 if reason:
                     raise ValueError(reason)
+                # Fix 3-1 follow-up: the kernel is now the side that declares
+                # the signature, so a parameter that bind_kernel_call cannot
+                # fill only surfaces at runtime -- one full verification round
+                # (25-30 min) later (P57 round 6: stride_h/padding_w/batch_size
+                # on top of the single tensor input). Reject the seed here and
+                # let the existing complete-format repair feed the reason back.
+                reason = kernel_signature_bindability(wrapper, problem_description)
+                if reason:
+                    raise ValueError(reason)
             return bundle
         return self._extract_code_from_response(
             response_text,
@@ -744,6 +893,7 @@ def kernel_function(*args, **kwargs):
         test_code: str | None = None,
         generate_default_test: bool = True,
         execution_direction: str | None = None,
+        verify_direction: str | None = None,
     ) -> dict[str, Any]:
         """
         Generate an optimized Triton kernel for the given problem.
@@ -757,6 +907,10 @@ def kernel_function(*args, **kwargs):
                       3. Exit with code 0 on success, 1 on failure
             execution_direction: Trusted forward, backward, or joint target.
                       Without it, only an explicit marker determines direction.
+            verify_direction: Optional verification contract for the generated
+                      correctness test. ``forward`` verifies forward outputs
+                      only (KernelBench scoring); falls back to
+                      KERNELAGENT_VERIFY_DIRECTION, then the legacy contract.
             generate_default_test: If True (default), auto-generate a primary
                       test using the LLM. The generated test runs before any
                       provided ``test_code``.
@@ -770,10 +924,22 @@ def kernel_function(*args, **kwargs):
         self._last_experience_text_retrieval_ids = []
         self.logger.info(f"Problem: {problem_description[:100]}...")
 
+        # Fix 7-1: forward-only scoring for benchmarks whose metric compares
+        # the forward output (KernelBench). Resolved from the caller, then
+        # KERNELAGENT_VERIFY_DIRECTION; None keeps the legacy contract.
+        resolved_verify_direction = resolve_verify_direction(verify_direction)
+        if resolved_verify_direction:
+            self.logger.info(
+                "Verification contract: %s-only correctness test",
+                resolved_verify_direction,
+            )
+
         # Normalize test_code to list[str]
         test_code_list: list[str] = []
         if generate_default_test:
-            generated = self._generate_test(problem_description, None)
+            generated = self._generate_test(
+                problem_description, None, verify_direction=resolved_verify_direction
+            )
             self.logger.info("Generated default test code using LLM")
             test_code_list.append(generated)
         if test_code is not None:
@@ -798,7 +964,14 @@ def kernel_function(*args, **kwargs):
              if (value := _declared_execution_direction(source))),
             None,
         )
-        direction = execution_direction or declared or "unknown"
+        direction = (
+            execution_direction
+            or declared
+            # A forward-only contract must also drive the deterministic suite so
+            # its companion test does not demand gradients.
+            or (resolved_verify_direction if resolved_verify_direction == "forward" else None)
+            or "unknown"
+        )
         from .case_suite import suite_test
         reference_tree = _parse_reference_problem(problem_description)
         companion = None

@@ -162,6 +162,63 @@ def validate_test_autograd(source: str) -> None:
                 rebound.update(
                     n.id for n in ast.walk(target) if isinstance(n, ast.Name))
 
+    # The 2-1 leaf rule (fix 2-1 / fix 4-1) covers every value that is a leaf
+    # at runtime, not only torch factories and move():
+    #   * ``for p in model.parameters()/buffers()`` (and the ``named_*`` tuple
+    #     forms) yields ``nn.Parameter``/registered buffer objects, which are
+    #     leaves -- setting ``p.requires_grad = True`` on them is legal. Observed
+    #     live on 2026-10-25 (agent_20261025_093522.log): a legal
+    #     ``for param in ref_model.parameters(): param.requires_grad = True`` was
+    #     rejected and cost a full regeneration.
+    #   * ``t.detach()`` returns a new tensor with no graph, so the result is a
+    #     leaf and also an independent differentiation root.
+    # Both keep move()'s fail-closed guard: a locally rebound helper name (or a
+    # monkeypatched Tensor method) voids recognition instead of trusting it.
+    STATE_ITERATORS = {
+        "parameters": 1, "buffers": 1, "named_parameters": 2, "named_buffers": 2,
+    }
+    state_iteration_shadowed = False
+    detach_shadowed = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in STATE_ITERATORS:
+                state_iteration_shadowed = True
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute):
+                    if target.attr in STATE_ITERATORS:
+                        state_iteration_shadowed = True
+                    if target.attr == "detach":
+                        detach_shadowed = True
+
+    def state_iteration_leaf(stmt):
+        """Loop-variable names bound to model state by ``for p in m.parameters()``."""
+        if state_iteration_shadowed:
+            return set()
+        value = stmt.iter
+        if not (isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)):
+            return set()
+        arity = STATE_ITERATORS.get(value.func.attr)
+        if arity is None:
+            return set()
+        names = [n.id for n in ast.walk(stmt.target) if isinstance(n, ast.Name)]
+        # ``for p in m.parameters()`` binds the value directly; the named_*
+        # forms bind ``(name, value)`` and the value is the leaf.
+        if len(names) != arity:
+            return set()
+        return {names[-1]}
+
+    def detach_leaf(value):
+        """True when ``value`` is ``x.detach()``: a fresh leaf, no autograd graph."""
+        if detach_shadowed:
+            return False
+        return (isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "detach"
+                and not value.args and not value.keywords)
+
     def move_leaf(value, move_tensors):
         """True when ``value`` is a fresh-leaf-producing suite move() result.
 
@@ -205,6 +262,14 @@ def validate_test_autograd(source: str) -> None:
                             mode = False
                 check_block(stmt.body, blocked, live, leaf_tensors, move_tensors, mode)
                 continue
+            if isinstance(stmt, (ast.For, ast.AsyncFor)):
+                # The loop variable names leaves for the duration of the loop and
+                # after it (it still holds the last yielded value), which is what
+                # the 2-1 rule needs for ``for p in model.parameters()``.
+                iterated = state_iteration_leaf(stmt)
+                if iterated:
+                    leaf_tensors.update(iterated)
+                    move_tensors.difference_update(iterated)
             # Scan this statement's expressions, not nested function/control bodies.
             expressions = [child for child in ast.iter_child_nodes(stmt)
                            if isinstance(child, ast.expr)]
@@ -241,8 +306,10 @@ def validate_test_autograd(source: str) -> None:
                                 and t.value.id not in leaf_tensors):
                             raise ValueError(
                                 "Invalid correctness test: only a fresh leaf tensor "
-                                "(a torch factory result, or a move(...) result from "
-                                "kernel_case_suite, which always returns fresh leaf "
+                                "(a torch factory result, a value iterated from "
+                                "Module.parameters()/buffers(), a .detach() result, "
+                                "or a move(...) result from kernel_case_suite, which "
+                                "always returns fresh leaf "
                                 "tensors) may have .requires_grad set to True, not a "
                                 f"derived tensor at line {t.lineno}. A value such as "
                                 ".clone() is not a leaf and fails at runtime; to "
@@ -260,6 +327,7 @@ def validate_test_autograd(source: str) -> None:
                                  or value.args[0].value is True))
                     factory = (isinstance(value, ast.Call) and dotted(value.func) in FACTORY_CALLS)
                     moved = move_leaf(value, move_tensors)
+                    detached = detach_leaf(value)
                     factory_grad = factory and any(
                         k.arg == "requires_grad" and isinstance(k.value, ast.Constant)
                         and k.value.value is True for k in value.keywords)
@@ -267,8 +335,11 @@ def validate_test_autograd(source: str) -> None:
                     # Recognized factories also do not inherit their template's graph.
                     # A move() result is a fresh differentiation root: its copy_ runs
                     # under no_grad, so gradients never flow back to the source and it
-                    # must never inherit "blocked" status (fix 4-1).
-                    if not leaf and not factory and not moved and (
+                    # must never inherit "blocked" status (fix 4-1). A ``.detach()``
+                    # result is the same kind of root: it carries no graph, so
+                    # differentiating it is legal even when its source was computed
+                    # under no_grad/inference_mode.
+                    if not leaf and not factory and not moved and not detached and (
                         disabled or (value_dependencies & blocked and not value_dependencies & live)
                     ):
                         blocked.update(names)
@@ -282,12 +353,13 @@ def validate_test_autograd(source: str) -> None:
                         else:
                             live.difference_update(names)
                     # Track leaf status for the 2-1 rule: a plain name assigned a
-                    # torch-factory or move()-derived value is a leaf; any other
-                    # assignment revokes it. move()-derived names are tracked
-                    # separately so their container elements count as leaves too.
+                    # torch-factory, .detach() or move()-derived value is a leaf;
+                    # any other assignment revokes it. move()-derived names are
+                    # tracked separately so their container elements count as
+                    # leaves too.
                     for t in targets:
                         if isinstance(t, ast.Name):
-                            if factory:
+                            if factory or detached:
                                 leaf_tensors.add(t.id)
                                 move_tensors.discard(t.id)
                             elif moved:
@@ -403,3 +475,61 @@ def validate_test_kernel_call_binding(source: str) -> None:
             "exercised; import bind_kernel_call from kernel_case_suite and route "
             "the call through bind_kernel_call(kernel_function, model_copy, inputs)."
         )
+
+
+# Backward-verification calls that a forward-only test must not contain.
+_FORWARD_ONLY_BACKWARD_ATTRS = ("backward",)
+_FORWARD_ONLY_GRAD_CALLS = (
+    "torch.autograd.grad",
+    "autograd.grad",
+    "torch.autograd.backward",
+)
+
+
+def validate_forward_only_test(source: str) -> None:
+    """Reject training-style grad checks in a forward-only correctness test.
+
+    KernelBench scores the forward output only, so a test that also calls
+    ``backward()`` reimposes a contract the benchmark never runs (observed as
+    repeated "Weight gradient mismatch" after the forward case had passed).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid correctness test: invalid Python: {exc}") from exc
+
+    def dotted(node: ast.AST) -> str:
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return f"{node.value.id}.{node.attr}"
+        if isinstance(node, ast.Attribute):
+            inner = dotted(node.value)
+            return f"{inner}.{node.attr}" if inner else node.attr
+        if isinstance(node, ast.Name):
+            return node.id
+        return ""
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if dotted(node.func) in _FORWARD_ONLY_GRAD_CALLS:
+                raise ValueError(
+                    "Invalid correctness test: forward-only verification was "
+                    f"requested, but the test calls {dotted(node.func)} at line "
+                    f"{node.lineno}. Remove every backward/autograd.grad step and "
+                    "compare forward outputs only."
+                )
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "grad_outputs"
+                    or (keyword.arg == "gradients")
+                ):
+                    raise ValueError(
+                        "Invalid correctness test: forward-only verification was "
+                        f"requested, but the test passes {keyword.arg}= at line "
+                        f"{node.lineno}. Remove the gradient comparison."
+                    )
+        elif isinstance(node, ast.Attribute) and node.attr in _FORWARD_ONLY_BACKWARD_ATTRS:
+            raise ValueError(
+                "Invalid correctness test: forward-only verification was "
+                f"requested, but the test calls .backward() at line {node.lineno}. "
+                "Remove every backward step and compare forward outputs only."
+            )
