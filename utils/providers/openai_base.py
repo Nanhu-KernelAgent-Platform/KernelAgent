@@ -17,7 +17,7 @@
 import logging
 import os
 from typing import Any
-from .base import BaseProvider, LLMResponse
+from .base import BaseProvider, LLMResponse, resolve_output_cap
 from .env_config import configure_proxy_environment
 from ..token_ledger import record as _record_tokens
 
@@ -79,9 +79,20 @@ class OpenAICompatibleProvider(BaseProvider):
             self._original_proxy_env = configure_proxy_environment()
 
             # Initialize client (proxy configured via environment variables)
+            # Fix P0: the read timeout must cover the longest allowed generation.
+            # At the measured ~9.2 tok/s a 32,768-token response needs ~3,560s,
+            # plus up to ~45s of prefill for a large prompt. The old 2700s only
+            # covered 24,840 tokens, so full-length responses were cut and the
+            # SDK retried twice (2h15m of waste before the round failed).
+            #
+            # Fix P0 (D): disable SDK auto-retry. This is a local single-stream
+            # decoder (~9.4 tok/s); a retry only re-queues another 45-80 min
+            # behind the same lock with no chance of succeeding. Fail the round
+            # fast and let the round budget / next-round backstop handle it.
             client_kwargs: dict[str, Any] = {
                 "api_key": api_key,
-                "timeout": float(os.getenv("OPENAI_TIMEOUT_S", "2700")),
+                "timeout": float(os.getenv("OPENAI_TIMEOUT_S", "4800")),
+                "max_retries": int(os.getenv("OPENAI_MAX_RETRIES", "0")),
             }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
@@ -114,7 +125,7 @@ class OpenAICompatibleProvider(BaseProvider):
             "input": messages,
             "max_output_tokens": min(
                 kwargs.get("max_tokens", 8192),
-                self.get_max_tokens_limit(model_name),
+                resolve_output_cap(model_name, self),
             ),
             "store": False,
         }
@@ -166,6 +177,10 @@ class OpenAICompatibleProvider(BaseProvider):
             model=model_name,
             provider=self.name,
             usage=_usage,
+            # Fix 6-1: surface finish_reason ('length' == cut at output cap)
+            # for the truncation detector. Only the single-response chat
+            # path is filled for now; other sites default to None ("unknown").
+            finish_reason=getattr(response.choices[0], "finish_reason", None),
         )
 
     def get_multiple_responses(
@@ -213,8 +228,11 @@ class OpenAICompatibleProvider(BaseProvider):
             params["temperature"] = kwargs.get("temperature", 0.7)
 
         # Use max_completion_tokens for newer models like GPT-5, fallback to max_tokens
+        # Fix 6-1: resolve the cap through the shared resolver so the
+        # KERNELAGENT_OUTPUT_CAP override cannot be defeated by the registry
+        # default (8192) for unregistered models.
         max_tokens_value = min(
-            kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
+            kwargs.get("max_tokens", 8192), resolve_output_cap(model_name, self)
         )
         if model_name.startswith("gpt-5") or model_name.startswith("o"):
             params["max_completion_tokens"] = max_tokens_value

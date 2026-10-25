@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -34,9 +35,11 @@ from triton_kernel_agent.kernel_backend import (
     extract_kernel_bundle,
     get_kernel_backend,
     validate_musa_bundle_semantics,
+    validate_template_instantiations,
 )
 from triton_kernel_agent.worker_util import format_test_code_for_llm
 from utils.providers import get_model_provider
+from utils.providers.base import resolve_output_cap
 
 from .prompt_manager import PromptManager
 from .test_validation import validate_test_autograd, validate_test_layout, validate_kernel_globals
@@ -150,6 +153,82 @@ def normalize_musa_imports(source: str) -> str:
     return source
 
 
+# ---------------- Fix 6-1: output-cap truncation continuation ----------------
+#
+# The detector/continuation constants live in .llm_truncation so the agent seed
+# path can reuse them (previously only the worker knew about truncation, so a
+# seed cut at the cap was "repaired" by full regeneration under the same cap).
+from .llm_truncation import (  # noqa: E402  (import after the pattern tables)
+    CONTINUATION_PROMPT,
+    LLMCallResult,
+    MAX_CONTINUATIONS,
+    TRUNCATION_MARGIN_TOKENS,
+    looks_truncated as _looks_truncated,
+)
+
+
+# ---------------- Fix P0 (E): bound error text fed back into prompts ----------------
+#
+# A failing test can dump hundreds of KB to stdout/stderr; feeding that verbatim
+# into the refinement prompt pushes the server over its prompt-token limit
+# (observed 413: 176,943 tokens > 65,536). Keep the head (error type) and tail
+# (real traceback/assert) and elide the middle. The full text stays in
+# round_*.json for diagnosis.
+_ERROR_CLIP_CHARS = 16000
+
+
+def _clip_error_text(text: str, max_chars: int = _ERROR_CLIP_CHARS) -> str:
+    if not text or len(text) <= max_chars:
+        return text or ""
+    head = max_chars // 2
+    tail = max_chars - head
+    return (
+        f"{text[:head]}\n\n... [{len(text) - max_chars} chars elided] ...\n\n"
+        f"{text[-tail:]}"
+    )
+
+
+# ---------------- Fix P1 (B): classify malformed responses for next-round backstop ---
+#
+# A malformed response is a failed *attempt*, not a fatal error (fix P1 B): it
+# should consume one round and be retried, not terminate the whole run. But the
+# recovery prompt must match what a kernel-understanding model can actually act
+# on. We split the malformed reasons three ways:
+#   ① content  : nothing usable was produced -> regenerate fresh (no format nudge).
+#   ② format   : code exists but the FILE-block structure is wrong -> re-state the
+#                format contract in the model's own instruction vocabulary (the raw
+#                "missing required files: ..." diagnostic is a validation-side
+#                symptom the model was never trained to interpret).
+#   ③ semantic : operator/contract defect (toolchain, device builtins, ...) -> feed
+#                the reason directly; it is in the model's comprehension domain.
+_MALFORMED_CONTENT_MARKERS = (
+    "no Python kernel code was extracted",
+    "invalid Python syntax",
+)
+_MALFORMED_FORMAT_MARKERS = (
+    "missing required files",
+    "missing required top-level kernel_function",
+    "kernel.py is missing required kernel_function",
+)
+
+_FORMAT_NUDGE = (
+    "Repair only the complete bundle output format. "
+    "Return all four files with literal FILE: kernel.py, FILE: binding.cpp, "
+    "FILE: kernel.mu and FILE: setup.py headers immediately before fenced code. "
+    "No prose, reference Model, input factories or test code in kernel.py. "
+    "Preserve the public contract and do not weaken any test."
+)
+
+
+def _classify_malformed(reason: str) -> str:
+    """Return 'content' | 'format' | 'semantic' for a malformed-reason string."""
+    if any(m in reason for m in _MALFORMED_CONTENT_MARKERS):
+        return "content"
+    if any(m in reason for m in _MALFORMED_FORMAT_MARKERS):
+        return "format"
+    return "semantic"
+
+
 class VerificationWorker:
     """Worker that verifies and refines a single kernel implementation."""
 
@@ -219,6 +298,26 @@ class VerificationWorker:
         except ValueError as e:
             # Provider not available, will use mock mode
             self.logger.warning(f"Provider not available: {e}")
+
+        # Fix 6-1: resolve the model's actual output cap once so the
+        # truncation threshold and requested max_tokens track a model swap
+        # instead of a hardcoded 16000/20000 pair.
+        self.output_cap = resolve_output_cap(self.openai_model, self.provider)
+        self._truncation_threshold = self.output_cap - TRUNCATION_MARGIN_TOKENS
+        self.logger.info(
+            "Output cap resolved for %s: %d (truncation threshold %d; set "
+            "KERNELAGENT_OUTPUT_CAP or extend the provider registry if the "
+            "model supports more)",
+            self.openai_model,
+            self.output_cap,
+            self._truncation_threshold,
+        )
+
+        # Fix P1 (F): whole-run wall-clock budget. Once a malformed response no
+        # longer terminates the run (fix P1 B), every round can legitimately be
+        # consumed, so the round cap alone can no longer bound wall time. This
+        # is the explicit backstop; 0 disables it.
+        self.round_budget_s = int(os.getenv("KERNELAGENT_ROUND_BUDGET_S", "10800"))
 
     def _setup_logging(self):
         """Setup worker-specific logging."""
@@ -540,6 +639,17 @@ class VerificationWorker:
         Returns:
             Generated response text
         """
+        return self._call_llm_detailed(messages, **kwargs).content
+
+    def _call_llm_detailed(self, messages: list, **kwargs) -> LLMCallResult:
+        """Like _call_llm but also surfaces completion_tokens and finish_reason.
+
+        Both feed the truncation detector (fix 6-1): ``finish_reason ==
+        'length'`` is the universal cap-hit signal on well-behaved servers,
+        while the token threshold covers servers that report ``'stop'`` at
+        the cap (all 10 truncated MusaCoder refinement responses in the
+        P45-56 batch did exactly that).
+        """
         if not self.provider:
             raise RuntimeError(f"No provider available for model {self.openai_model}")
 
@@ -548,7 +658,16 @@ class VerificationWorker:
             kwargs["high_reasoning_effort"] = True
 
         response = self.provider.get_response(self.openai_model, messages, **kwargs)
-        return response.content
+        completion_tokens = None
+        if isinstance(response.usage, dict):
+            raw = response.usage.get("completion_tokens")
+            if isinstance(raw, int):
+                completion_tokens = raw
+        return LLMCallResult(
+            content=response.content,
+            completion_tokens=completion_tokens,
+            finish_reason=getattr(response, "finish_reason", None),
+        )
 
     def _refine_kernel(
         self,
@@ -600,16 +719,28 @@ class VerificationWorker:
                     no_cusolver=self.no_cusolver,
                 )
 
-                # Call LLM API
-                messages = [{"role": "user", "content": prompt}]
-                for format_attempt in range(2 if self._kernel_backend.name == "musa" else 1):
-                    response_text = self._call_llm(messages, max_tokens=20000)
+                # Call LLM API — truncation continuation (fix 6-1):
+                #   A truncated response is continued on the extended thread
+                #   (<= MAX_CONTINUATIONS). Fix P1 (A) removed the same-round
+                #   Phase-2 format repair: a still-malformed response is raised
+                #   so run()'s backstop (fix P1 B) consumes a round and
+                #   regenerates next round.
+                base_messages = [{"role": "user", "content": prompt}]
+                thread = list(base_messages)
+                accumulated = ""
+                segment = self._call_llm_detailed(thread, max_tokens=self.output_cap)
+                refined_kernel = None
+                malformed_reason = None
+                last_segment = ""
+                last_reason = "no response"
+                for cont in range(MAX_CONTINUATIONS + 1):
+                    candidate = accumulated + segment.content
                     try:
                         refined_kernel = (
-                            extract_kernel_bundle(response_text)
+                            extract_kernel_bundle(candidate)
                             if self._kernel_backend.name == "musa"
                             else self._extract_code_from_response(
-                                response_text,
+                                candidate,
                                 prefer_kernel_function=getattr(self, "_has_multiple_tests", False),
                             )
                         )
@@ -619,31 +750,48 @@ class VerificationWorker:
                         malformed_reason = str(exc)
                     if not malformed_reason:
                         break
-                    # Preserve rejected output for diagnosis, with bounded format repair.
-                    (self.log_dir / f"refinement_rejected_{len(self.history)}_{format_attempt}.txt").write_text(
-                        response_text, encoding="utf-8")
-                    if self._kernel_backend.name != "musa" or format_attempt == 1:
-                        raise ValueError(f"Malformed LLM kernel response: {malformed_reason}")
-                    self.logger.warning("Malformed MUSA refinement; retrying format once: %s", malformed_reason)
-                    messages.extend([
-                        {"role": "assistant", "content": response_text},
-                        {"role": "user", "content":
-                         "Repair only the complete bundle output format. " + malformed_reason
-                         + ". Return all four files with literal FILE: kernel.py, FILE: binding.cpp, "
-                         "FILE: kernel.mu and FILE: setup.py headers immediately before fenced code. "
-                         "No prose, reference Model, input factories or test code in kernel.py. "
-                         "Preserve the public contract and do not weaken any test."},
+                    last_segment, last_reason = segment.content, malformed_reason
+                    if cont == MAX_CONTINUATIONS or not _looks_truncated(
+                        segment, malformed_reason, self._truncation_threshold
+                    ):
+                        break
+                    # Preserve the raw truncated segment for diagnosis.
+                    (self.log_dir / f"refinement_truncated_{len(self.history)}_{cont}.txt").write_text(
+                        segment.content, encoding="utf-8")
+                    self.logger.warning(
+                        "Truncated MUSA refinement (cont=%d, completion_tokens=%s, "
+                        "finish_reason=%s); requesting continuation",
+                        cont, segment.completion_tokens, segment.finish_reason,
+                    )
+                    thread.extend([
+                        {"role": "assistant", "content": segment.content},
+                        {"role": "user", "content": CONTINUATION_PROMPT},
                     ])
+                    accumulated = candidate
+                    segment = self._call_llm_detailed(thread, max_tokens=self.output_cap)
 
-                if refined_kernel:
+                # A partial native bundle that failed validation (e.g. only
+                # kernel.py survived the truncation) must not be returned as a
+                # success. Fix P1 (A): there is no same-round format repair —
+                # raise so run()'s backstop (fix P1 B) consumes a round and
+                # regenerates next round. Raw (non-native) backends keep the
+                # legacy behavior of handing the candidate to the compile/test
+                # round, which reports the real error back into the next
+                # refinement.
+                if refined_kernel and (
+                    not malformed_reason or not isinstance(refined_kernel, KernelBundle)
+                ):
                     self.logger.info(
                         f"Successfully refined kernel using {self.openai_model}"
                     )
                     return refined_kernel
-                else:
-                    self.logger.error("Failed to extract valid code from LLM response")
-                    # Return original kernel if extraction fails
-                    return kernel_code
+
+                # Preserve the rejected segment for diagnosis, then raise. The
+                # round loop (run()) turns this into a next-round regeneration
+                # instead of terminating the whole run (fix P1 B).
+                (self.log_dir / f"refinement_rejected_{len(self.history)}_0.txt").write_text(
+                    last_segment, encoding="utf-8")
+                raise ValueError(f"Malformed LLM kernel response: {last_reason}")
 
             except Exception as e:
                 if "Malformed LLM kernel response" in str(e):
@@ -696,6 +844,35 @@ class VerificationWorker:
         return {"worker_id": self.worker_id, "success": False, "rounds": rounds,
                 "history": list(self.history), **details}
 
+    def _malformed_error_info(
+        self, reason: str, last_stdout: str, last_stderr: str
+    ) -> dict[str, Any]:
+        """Build error_info for a round recovering from a malformed LLM response.
+
+        The instruction is chosen by failure class (fix P1 B) so a
+        kernel-understanding model is never asked to interpret a raw format
+        diagnostic ("missing required files: ...") it was not trained on. The
+        previous real test output is carried along so the model can fix both
+        format and semantics in the same regeneration.
+        """
+        kind = _classify_malformed(reason)
+        if kind == "content":
+            nudge = (
+                "The previous generation produced no extractable kernel code. "
+                "Produce a fresh, complete implementation."
+            )
+        elif kind == "format":
+            nudge = _FORMAT_NUDGE
+        else:  # semantic: operator/contract defect, in the model's domain
+            nudge = reason
+        stderr = _clip_error_text(last_stderr)
+        stderr = f"{stderr}\n\n{nudge}" if stderr else nudge
+        return {
+            "stdout": _clip_error_text(last_stdout),
+            "stderr": stderr,
+            "history": list(self.history),
+        }
+
     def run(
         self,
         kernel_code: str | KernelBundle,
@@ -722,12 +899,19 @@ class VerificationWorker:
             return self._failed_run(0, error=test_error, failure_kind="invalid_correctness_test")
         self._has_multiple_tests = len(test_code) > 1
 
+        t_start = time.monotonic()
         current_kernel = kernel_code
+        # Fix P1 (B): a malformed response no longer terminates the run. The
+        # reason is carried across rounds and consumed as one attempt each.
+        pending_malformed: str | None = None
+        last_stdout = last_stderr = ""
+
         malformed_reason = self._validate_kernel_candidate(current_kernel)
         if malformed_reason:
-            error_feedback = f"Malformed LLM kernel response: {malformed_reason}"
-            self.logger.warning(f"❌ {error_feedback}")
-            return self._failed_run(0, error=error_feedback)
+            pending_malformed = f"Malformed LLM kernel response: {malformed_reason}"
+            self.logger.warning(
+                f"❌ seed {pending_malformed}; round 1 will regenerate from it"
+            )
 
         for round_num in range(self.max_rounds):
             # Check if another worker has succeeded
@@ -740,50 +924,74 @@ class VerificationWorker:
                     "rounds": round_num,
                 }
 
-            self.logger.info(f"Round {round_num + 1}/{self.max_rounds}")
-
-            # Write files - test only on first round, kernel every round
-            if round_num == 0:
-                # First round: write both kernel and test(s)
-                self._write_files(current_kernel, test_code)
-            else:
-                # Subsequent rounds: only update kernel, test remains unchanged
-                self._write_kernel(current_kernel)
-
-            # Run verification (additional tests chained automatically by _run_test)
-            success, stdout, stderr, violation = self._single_verification_pass(
-                current_kernel
-            )
-
-            if violation:
-                success, stdout, stderr = False, "", violation
-
-            # Log round
-            self._log_round(round_num + 1, success, current_kernel, stdout, stderr)
-
-            if success:
-                self.logger.info(
-                    f"Success! Kernel passed test in round {round_num + 1}"
+            # Fix P1 (F): explicit whole-run wall-clock budget. With malformed
+            # responses now consuming rounds instead of terminating, the round
+            # cap alone can no longer bound wall time.
+            if self.round_budget_s and time.monotonic() - t_start > self.round_budget_s:
+                self.logger.warning(
+                    "Run budget exceeded after %.0f s (limit %d s)",
+                    time.monotonic() - t_start, self.round_budget_s,
                 )
-                return {
-                    "worker_id": self.worker_id,
-                    "success": True,
-                    "case_results": getattr(self, "last_case_results", []),
-                    "kernel_code": (
-                        dict(current_kernel.files)
-                        if isinstance(current_kernel, KernelBundle)
-                        else current_kernel
-                    ),
-                    "rounds": round_num + 1,
+                return self._failed_run(round_num, budget_exceeded=True)
+
+            if pending_malformed is None:
+                self.logger.info(f"Round {round_num + 1}/{self.max_rounds}")
+
+                # Write files - test only on first round, kernel every round
+                if round_num == 0:
+                    # First round: write both kernel and test(s)
+                    self._write_files(current_kernel, test_code)
+                else:
+                    # Subsequent rounds: only update kernel, test remains unchanged
+                    self._write_kernel(current_kernel)
+
+                # Run verification (additional tests chained automatically by _run_test)
+                success, stdout, stderr, violation = self._single_verification_pass(
+                    current_kernel
+                )
+
+                if violation:
+                    success, stdout, stderr = False, "", violation
+
+                # Log round
+                self._log_round(round_num + 1, success, current_kernel, stdout, stderr)
+
+                if success:
+                    self.logger.info(
+                        f"Success! Kernel passed test in round {round_num + 1}"
+                    )
+                    return {
+                        "worker_id": self.worker_id,
+                        "success": True,
+                        "case_results": getattr(self, "last_case_results", []),
+                        "kernel_code": (
+                            dict(current_kernel.files)
+                            if isinstance(current_kernel, KernelBundle)
+                            else current_kernel
+                        ),
+                        "rounds": round_num + 1,
+                        "history": list(self.history),
+                    }
+
+                last_stdout, last_stderr = stdout, stderr
+                # Fix P0 (E): bound error text so a runaway stdout/stderr cannot
+                # push the next refinement prompt over the server prompt limit.
+                error_info = {
+                    "stdout": _clip_error_text(stdout),
+                    "stderr": _clip_error_text(stderr),
                     "history": list(self.history),
                 }
-
-            # Refine kernel for next round
-            error_info = {
-                "stdout": stdout,
-                "stderr": stderr,
-                "history": list(self.history),
-            }
+            else:
+                # Fix P1 (B): malformed recovery round. The previous kernel was
+                # not regenerated successfully, so skip verification and
+                # regenerate with a prompt tailored to the malformed class.
+                self.logger.info(
+                    f"Round {round_num + 1}/{self.max_rounds} (malformed recovery)"
+                )
+                self._log_round(round_num + 1, False, current_kernel, "", pending_malformed)
+                error_info = self._malformed_error_info(
+                    pending_malformed, last_stdout, last_stderr
+                )
 
             try:
                 current_kernel = self._refine_kernel(
@@ -798,9 +1006,10 @@ class VerificationWorker:
             except ValueError as exc:
                 if "Malformed LLM kernel response" not in str(exc):
                     raise
-                error_feedback = str(exc)
-                self.logger.warning(f"❌ {error_feedback}")
-                return self._failed_run(round_num + 1, error=error_feedback)
+                pending_malformed = str(exc)
+                self.logger.warning(f"❌ {pending_malformed}")
+                continue
+            pending_malformed = None
 
         # Max rounds reached without success
         self.logger.warning(f"Max rounds ({self.max_rounds}) reached without success")
@@ -822,6 +1031,12 @@ class VerificationWorker:
             message = f"Disallowed PyTorch usage detected: {violation}"
             self.logger.error(message)
             return False, "", message, message
+
+        if self._kernel_backend.name == "musa":
+            reason = validate_template_instantiations(kernel_code)
+            if reason:
+                self.logger.error(reason)
+                return False, "", reason, None
 
         from .case_suite import SUITE_MARKER
         has_suite = any(SUITE_MARKER in path.read_text() for path in self.test_files if path.exists())
@@ -900,8 +1115,8 @@ class VerificationWorker:
             self.logger.info(f"Refinement attempt {attempt}/{max_refine_attempts}...")
 
             error_info = {
-                "stdout": stdout,
-                "stderr": stderr,
+                "stdout": _clip_error_text(stdout),
+                "stderr": _clip_error_text(stderr),
                 "error_type": (
                     "compilation"
                     if "CompilationError" in error_output
