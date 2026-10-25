@@ -306,3 +306,94 @@ def validate_musa_bundle_semantics(bundle: KernelBundle) -> str | None:
                 )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Explicit template instantiation arity (problem 62 class)
+# ---------------------------------------------------------------------------
+
+_TEMPLATE_DECL_RE = re.compile(
+    r"template\s*<([^>]*)>\s*[^;{(]*?\b(\w+)\s*\(([^()]*)\)", re.S)
+_TEMPLATE_INSTANTIATION_RE = re.compile(
+    r"template\s+(?!<)[^<>;{]*?\b(\w+)\s*<[^<>]*>\s*\(([^()]*)\)\s*;", re.S)
+_CONDITIONAL_COMPILATION_RE = re.compile(
+    r"^\s*#\s*(?:if|ifdef|ifndef|else|elif)\b", re.M)
+_NATIVE_SOURCE_FILES = ("kernel.mu", "binding.cpp")
+
+
+def _count_cpp_arguments(arguments: str) -> int:
+    """Argument count, treating commas inside <>, (), [], {} as non-separators."""
+    text = arguments.strip()
+    if text in ("", "void"):
+        return 0
+    depth = 0
+    count = 1
+    for char in text:
+        if char in "<([{":
+            depth += 1
+        elif char in ">)]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            count += 1
+    return count
+
+
+def validate_template_instantiations(
+    kernel_code: str | KernelBundle | Mapping[str, str],
+) -> str | None:
+    """Reject an explicit instantiation whose arity differs from its template.
+
+    ``template void f<T>(...)`` must repeat every template parameter. On a
+    mismatch mcc only reports "does not refer to a function template" plus a
+    "could not match ... against ..." note that the model cannot count from, so
+    the refinement loop repeats the same off-by-one (problem 62, 2026-10-25:
+    two wasted 29-minute refinements). Reporting the exact counts instead keeps
+    the repair actionable.
+
+    Fail-open by construction: an arity that cannot be pinned down (parameter
+    pack, defaulted parameter, conditional compilation, conflicting
+    declarations) is never reported, and an unparseable bundle yields None.
+    """
+    bundle = (
+        extract_kernel_bundle(kernel_code)
+        if isinstance(kernel_code, str)
+        else kernel_code
+    )
+    if isinstance(bundle, Mapping):
+        files = dict(bundle)
+    elif isinstance(bundle, KernelBundle):
+        files = bundle.files
+    else:
+        return None
+    for filename in _NATIVE_SOURCE_FILES:
+        source = files.get(filename) or ""
+        if not source or _CONDITIONAL_COMPILATION_RE.search(source):
+            continue
+        declared: dict[str, set[int]] = {}
+        untrusted: set[str] = set()
+        for match in _TEMPLATE_DECL_RE.finditer(source):
+            template_parameters, name, parameters = match.groups()
+            if not template_parameters.strip():
+                continue  # ``template <>`` explicit specialization: out of scope
+            if "..." in parameters or "..." in template_parameters or "=" in parameters:
+                untrusted.add(name)  # pack / defaulted: arity may legitimately differ
+                continue
+            declared.setdefault(name, set()).add(_count_cpp_arguments(parameters))
+        for match in _TEMPLATE_INSTANTIATION_RE.finditer(source):
+            name, arguments = match.groups()
+            arities = declared.get(name) or set()
+            if name in untrusted or len(arities) != 1:
+                continue  # unknown or ambiguous arity: never guess
+            declared_count = next(iter(arities))
+            passed_count = _count_cpp_arguments(arguments)
+            if passed_count == declared_count:
+                continue
+            line = source.count("\n", 0, match.start()) + 1
+            return (
+                f"{filename}:{line}: explicit instantiation of '{name}' passes "
+                f"{passed_count} arguments but its template declares "
+                f"{declared_count} parameters. Repeat every template parameter in "
+                f"the 'template void {name}<...>(...)' line, or delete that line: "
+                f"the call sites in binding.cpp already instantiate the template."
+            )
+    return None
