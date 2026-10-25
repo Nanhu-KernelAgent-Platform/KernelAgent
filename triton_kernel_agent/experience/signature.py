@@ -32,7 +32,6 @@ _OPERATOR_KEYWORDS = (
     "layernorm",
     "softmax",
     "sigmoid",
-    "transpose",
     "matmul",
     "gemm",
     "reduction",
@@ -43,6 +42,12 @@ _OPERATOR_KEYWORDS = (
     "conv",
     "pooling",
     "pool",
+    # "transpose" must come AFTER the families whose own descriptions say
+    # "transposed": ConvTranspose2d/3d document a "transposed convolution" and
+    # Matmul problems say "transposed A/B". A first-match on a bare "transpose"
+    # misroutes ConvTranspose* to the tensor-transpose template, whose
+    # permutation/stride guidance is wrong for a deconvolution.
+    "transpose",
     "elementwise",
 )
 _IGNORED_TOKENS = {

@@ -14,7 +14,7 @@
 
 """LLM Provider system for KernelAgent."""
 
-from .base import BaseProvider, LLMResponse
+from .base import BaseProvider, LLMResponse, resolve_output_cap
 from .openai_provider import OpenAIProvider
 from .grok_provider import GrokProvider
 from .anthropic_provider import AnthropicProvider
@@ -24,6 +24,7 @@ from .models import get_model_provider, get_available_models, is_model_available
 __all__ = [
     "BaseProvider",
     "LLMResponse",
+    "resolve_output_cap",
     "OpenAIProvider",
     "GrokProvider",
     "AnthropicProvider",

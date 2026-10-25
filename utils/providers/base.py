@@ -29,6 +29,39 @@ class LLMResponse:
     provider: str
     usage: dict[str, Any] | None = None
     response_id: str | None = None
+    # Fix 6-1: 'length' lets callers detect output-cap truncation with zero
+    # config on well-behaved servers. None means "unknown" (not "stop"), so
+    # construction sites that do not surface it simply fall back to the
+    # token-threshold detection without any behavior hole.
+    finish_reason: str | None = None
+
+
+def resolve_output_cap(
+    model_name: str, provider: "BaseProvider | None" = None, default: int = 16384
+) -> int:
+    """Effective output-token cap for requests to ``model_name`` (fix 6-1).
+
+    Priority:
+      1. ``KERNELAGENT_OUTPUT_CAP`` env override (deployment assertion; the
+         zero-code path when switching to a model the registry does not know);
+      2. the per-model registry (``provider.get_max_tokens_limit``);
+      3. ``default`` (offline/test environments where no provider exists).
+
+    The web clamp in ``OpenAICompatibleProvider`` consumes this same resolver
+    so the requested limit and the truncation-detection threshold never
+    disagree.
+    """
+    override = os.getenv("KERNELAGENT_OUTPUT_CAP")
+    if override and override.strip().isdigit() and int(override) > 0:
+        return int(override)
+    if provider is not None:
+        try:
+            cap = int(provider.get_max_tokens_limit(model_name))
+        except Exception:
+            cap = 0
+        if cap > 0:
+            return cap
+    return default
 
 
 class BaseProvider(ABC):

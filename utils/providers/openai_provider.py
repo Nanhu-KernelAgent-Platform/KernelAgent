@@ -32,7 +32,13 @@ class OpenAIProvider(OpenAICompatibleProvider):
     def get_max_tokens_limit(self, model_name: str) -> int:
         """Get the output-token limit used by KernelAgent requests."""
         if "musacoder" in model_name.lower():
-            return 16384
+            # A complete 4-file native MUSA bundle (kernel.py, binding.cpp,
+            # kernel.mu, setup.py) for a forward+backward operator exceeds
+            # 16384 output tokens; at that cap the reply is cut mid-file and the
+            # bundle is rejected as "missing required files". The model supports
+            # a 262144-token context and the server honours MAX_TOKENS_CAP, so
+            # request 32768. KERNELAGENT_OUTPUT_CAP still overrides this value.
+            return 32768
         if model_name.startswith("gpt-5.6"):
             return 128000
         if model_name.startswith(("gpt-5", "gpt-4", "o3", "o1")):
