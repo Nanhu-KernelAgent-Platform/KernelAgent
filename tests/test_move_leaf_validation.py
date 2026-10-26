@@ -230,3 +230,154 @@ def test_rejection_message_names_the_legal_patterns():
     assert ".requires_grad_()" in message
     # The misleading torch.randn-only advice must be gone.
     assert "e.g. torch.randn(...)" not in message
+
+
+# ---------------------------------------------------------------------------
+# Same 2-1 leaf rule, extended the same way as move(): model state iterated out
+# of a Module and ``.detach()`` results are leaves too. Observed live on
+# 2026-10-25 (agent_20261025_093522.log): a legal
+# ``for param in ref_model.parameters(): param.requires_grad = True`` was
+# rejected and cost a full regeneration of the test.
+# ---------------------------------------------------------------------------
+
+MODEL_PARAMETER_LOOP_TEST = '''
+import torch
+from kernel import kernel_function
+from kernel_case_suite import bind_kernel_call, move
+
+def main():
+    ref_model = Model(*get_init_inputs())
+    for param in ref_model.parameters():
+        param.requires_grad = True
+    out = ref_model(*get_inputs())
+    out.sum().backward()
+'''
+
+MODEL_BUFFER_LOOP_TEST = '''
+import torch
+
+def main():
+    model = Model()
+    for buffer in model.buffers():
+        buffer.requires_grad = True
+'''
+
+NAMED_PARAMETER_LOOP_TEST = '''
+import torch
+
+def main():
+    model = Model()
+    for name, param in model.named_parameters():
+        param.requires_grad = True
+'''
+
+SUB_MODULE_PARAMETER_LOOP_TEST = '''
+import torch
+
+def main():
+    model = Model()
+    for param in model.conv.parameters():
+        param.requires_grad = True
+'''
+
+DETACH_LEAF_TEST = '''
+import torch
+
+def main():
+    y = torch.randn(3)
+    x = y.detach()
+    x.requires_grad = True
+'''
+
+# ``detach()`` makes an independent differentiation root: no graph survives the
+# detach, so differentiating it stays legal even under no_grad.
+DETACH_UNDER_NOGRAD_BACKWARD_TEST = '''
+import torch
+
+def main():
+    x = torch.randn(3, requires_grad=True)
+    with torch.no_grad():
+        y = model(x)
+    z = y.detach()
+    z.requires_grad = True
+    z.sum().backward()
+'''
+
+DETACH_THEN_CLONE_TEST = '''
+import torch
+
+def main():
+    y = torch.randn(3, requires_grad=True)
+    x = y.detach().clone()
+    x.requires_grad = True
+'''
+
+LOCAL_PARAMETERS_SHADOW_TEST = '''
+import torch
+
+def parameters(self):
+    return [self.weight.clone()]
+
+def main():
+    model = Model()
+    for param in model.parameters():
+        param.requires_grad = True
+'''
+
+NON_STATE_ITERATION_TEST = '''
+import torch
+
+def main():
+    a = torch.randn(3)
+    b = a.clone()
+    for tensor in [a, b]:
+        tensor.requires_grad = True
+'''
+
+
+def test_parameters_loop_variable_is_a_leaf():
+    validate_test_autograd(MODEL_PARAMETER_LOOP_TEST)
+
+
+def test_buffers_loop_variable_is_a_leaf():
+    validate_test_autograd(MODEL_BUFFER_LOOP_TEST)
+
+
+def test_named_parameters_tuple_form_binds_the_value_as_leaf():
+    validate_test_autograd(NAMED_PARAMETER_LOOP_TEST)
+
+
+def test_submodule_parameters_loop_variable_is_a_leaf():
+    validate_test_autograd(SUB_MODULE_PARAMETER_LOOP_TEST)
+
+
+def test_detach_result_is_a_leaf():
+    validate_test_autograd(DETACH_LEAF_TEST)
+
+
+def test_detach_result_under_no_grad_is_a_usable_root():
+    validate_test_autograd(DETACH_UNDER_NOGRAD_BACKWARD_TEST)
+
+
+def test_detach_chain_stays_derived():
+    # Truncation rule from fix 4-1: only the detach() call itself yields a leaf.
+    with pytest.raises(ValueError, match="not a derived tensor"):
+        validate_test_autograd(DETACH_THEN_CLONE_TEST)
+
+
+def test_shadowed_parameters_is_not_trusted():
+    with pytest.raises(ValueError, match="not a derived tensor"):
+        validate_test_autograd(LOCAL_PARAMETERS_SHADOW_TEST)
+
+
+def test_iteration_over_a_derived_list_is_not_a_leaf_source():
+    with pytest.raises(ValueError, match="not a derived tensor"):
+        validate_test_autograd(NON_STATE_ITERATION_TEST)
+
+
+def test_rejection_message_names_the_extended_leaf_patterns():
+    with pytest.raises(ValueError) as excinfo:
+        validate_test_autograd(CLONE_DERIVED_TEST)
+    message = str(excinfo.value)
+    assert "parameters()/buffers()" in message
+    assert ".detach()" in message
