@@ -6,7 +6,7 @@ import pytest
 from triton_kernel_agent.agent import TritonKernelAgent
 from triton_kernel_agent.kernel_backend import extract_kernel_bundle, get_kernel_backend
 from triton_kernel_agent.test_validation import validate_test_autograd, validate_test_layout, validate_kernel_globals
-from triton_kernel_agent.worker import VerificationWorker
+from triton_kernel_agent.worker import LLMCallResult, VerificationWorker
 from triton_kernel_agent.prompt_manager import PromptManager
 from triton_kernel_agent.platform_config import get_platform
 
@@ -67,9 +67,14 @@ def test_common_refinement_failure_still_rejects_malformed_result(tmp_path):
     w._single_verification_pass = Mock(return_value=(False, '', 'mismatch', None))
     w._refine_kernel = Mock(return_value='not a kernel bundle')
     result = w.run(extract_kernel_bundle(bundle_text()), ['print("PASS")'], 'formula', mp.Event())
-    assert not result['success'] and result['rounds'] == 1
-    assert result['error'].startswith('Malformed LLM kernel response:')
-    assert len(result['history']) == 1
+    # Fix P1 B: a malformed response is still rejected (never accepted as a
+    # passing kernel), but it now consumes every round instead of terminating
+    # the run after one attempt, so the max_rounds budget really applies.
+    assert not result['success']
+    assert result['rounds'] == w.max_rounds
+    assert result.get('max_rounds_reached') is True
+    # history is a deque capped at history_size (8 by default), not max_rounds.
+    assert len(result['history']) == w.history_size
 
 
 @pytest.mark.parametrize('source', [
@@ -262,35 +267,42 @@ def test_worker_rejects_invalid_test_without_kernel_refinement(tmp_path):
     w._single_verification_pass.assert_not_called()
 
 
-def test_musa_refinement_format_repair_once(tmp_path):
+def test_musa_refinement_has_no_same_round_format_repair(tmp_path):
+    # Fix P1 (A): a malformed first response no longer triggers a same-round
+    # format repair. It raises so run()'s backstop (fix P1 B) regenerates next
+    # round instead of emitting a second full bundle inside this round.
     w = worker(tmp_path)
     w.provider = object()
-    w._call_llm = Mock(side_effect=["not code", bundle_text(True)])
-    result = w._refine_kernel(extract_kernel_bundle(bundle_text()),
-                             {"stdout": "mismatch", "stderr": ""}, "formula", GOOD_TEST)
-    result.require(get_kernel_backend("musa"))
-    assert w._call_llm.call_count == 2
+    w._call_llm_detailed = Mock(side_effect=[
+        LLMCallResult("not code", None, None),
+        LLMCallResult(bundle_text(True), None, None),
+    ])
+    with pytest.raises(ValueError, match="Malformed LLM kernel response"):
+        w._refine_kernel(extract_kernel_bundle(bundle_text()),
+                         {"stdout": "mismatch", "stderr": ""}, "formula", GOOD_TEST)
+    assert w._call_llm_detailed.call_count == 1  # no repair second call
     assert (w.log_dir / "refinement_rejected_0_0.txt").read_text() == "not code"
 
 
 def test_musa_refinement_format_failure_remains_failure(tmp_path):
     w = worker(tmp_path)
     w.provider = object()
-    w._call_llm = Mock(return_value="not code")
+    w._call_llm_detailed = Mock(return_value=LLMCallResult("not code", None, None))
     with pytest.raises(ValueError, match="Malformed LLM kernel response"):
         w._refine_kernel(extract_kernel_bundle(bundle_text()),
                          {"stdout": "mismatch", "stderr": ""}, "formula", GOOD_TEST)
-    assert w._call_llm.call_count == 2
+    assert w._call_llm_detailed.call_count == 1  # no same-round repair (fix P1 A)
 
 
 def test_unsafe_refinement_does_not_fall_back_to_original(tmp_path):
     w = worker(tmp_path)
     w.provider = object()
-    w._call_llm = Mock(return_value="```python\n# FILE: ../kernel.py\npass\n```")
+    unsafe = "```python\n# FILE: ../kernel.py\npass\n```"
+    w._call_llm_detailed = Mock(return_value=LLMCallResult(unsafe, None, None))
     with pytest.raises(ValueError, match="Malformed LLM kernel response: Unsafe"):
         w._refine_kernel(extract_kernel_bundle(bundle_text()),
                          {"stdout": "mismatch", "stderr": ""}, "formula", GOOD_TEST)
-    assert w._call_llm.call_count == 2
+    assert w._call_llm_detailed.call_count == 1  # no same-round repair (fix P1 A)
 
 
 def test_musa_prompts_cover_generic_repeated_failures():
