@@ -443,11 +443,17 @@ def validate_test_kernel_call_binding(source: str) -> None:
 
     # An import of kernel_function already proves the test intends to exercise
     # the kernel, so the bind-call requirement applies from that point on.
-    referenced_kernel = any(
+    kernel_imported = any(
         isinstance(node, ast.ImportFrom) and node.module == "kernel"
         and any((item.asname or item.name) == "kernel_function" for item in node.names)
         for node in ast.walk(tree)
     )
+    kernel_module_imported = any(
+        isinstance(node, ast.Import)
+        and any(item.name == "kernel" for item in node.names)
+        for node in ast.walk(tree)
+    )
+    referenced_kernel = kernel_imported
     bind_calls = 0
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -474,6 +480,18 @@ def validate_test_kernel_call_binding(source: str) -> None:
             "Invalid correctness test: kernel_function is referenced but never "
             "exercised; import bind_kernel_call from kernel_case_suite and route "
             "the call through bind_kernel_call(kernel_function, model_copy, inputs)."
+        )
+    if referenced_kernel and not (kernel_imported or kernel_module_imported):
+        # Observed on conv_transpose2d (P65): the test used kernel_function as a
+        # name inside bind_kernel_call but never imported it, so every round died
+        # with "NameError: name 'kernel_function' is not defined" and the test
+        # file is generated once, so no refinement round could fix it.
+        raise ValueError(
+            "Invalid correctness test: kernel_function is used but never "
+            "imported. Add `from kernel import kernel_function` at module top "
+            "level (or `import kernel` and use kernel.kernel_function), and "
+            "route the call through bind_kernel_call(kernel_function, "
+            "model_copy, inputs). Repair the test, not the kernel."
         )
 
 

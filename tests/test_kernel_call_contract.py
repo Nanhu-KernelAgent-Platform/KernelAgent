@@ -203,6 +203,22 @@ def test_three_failed_attempts_raise_the_last_contract_error():
     assert agent._call_llm.call_count == 3
 
 
+def test_retry_log_reports_the_real_attempt_budget():
+    # The loop allows three attempts; the log line used to read "retry 1/2" and
+    # so hid the third attempt from anyone reading the log (triage, 2026-10-25).
+    agent = make_agent(get_platform("musa"))
+    agent._call_llm = Mock(
+        side_effect=[DIRECT_CALL_TEST, DIRECT_CALL_TEST, BIND_PATTERN_TEST]
+    )
+    assert agent._generate_test("formula") == BIND_PATTERN_TEST
+    warnings = agent.logger.warning.call_args_list
+    assert [call.args[0] for call in warnings] == [
+        "Generated test failed validity/contract checks; "
+        "retrying after attempt %d/%d: %s",
+    ] * 2
+    assert [(call.args[1], call.args[2]) for call in warnings] == [(1, 3), (2, 3)]
+
+
 def test_repair_message_carries_the_legal_leaf_pattern():
     # Fix 4-1 A2: the repair prompt must teach the concrete move() pattern
     # instead of the misleading torch.randn-only advice (P45/P47 evidence).
@@ -266,3 +282,33 @@ def test_reduction_variant_inherits_binding_contract():
     assert "Evaluation call convention" in prompt
     assert "bind_kernel_call" in prompt
     assert "cannot be baked in" in prompt
+
+
+def test_missing_kernel_function_import_is_rejected():
+    # Regression (P65 conv_transpose2d): the test used kernel_function as a name
+    # inside bind_kernel_call but never imported it, so every round died with
+    # "NameError: name 'kernel_function' is not defined" -- and the test file is
+    # generated once, so no refinement round could fix it.
+    missing_import = '''
+import torch
+from kernel_case_suite import bind_kernel_call, move
+
+def main():
+    model = torch.nn.Identity()
+    invoke = bind_kernel_call(kernel_function, model, [torch.randn(2)])
+    print(invoke())
+
+main()
+'''
+    with pytest.raises(ValueError, match="never imported"):
+        validate_test_kernel_call_binding(missing_import)
+
+    for source in (
+        "import torch\nfrom kernel import kernel_function\n"
+        "from kernel_case_suite import bind_kernel_call\n"
+        "bind_kernel_call(kernel_function, torch.nn.Identity(), [torch.randn(2)])\n",
+        "import torch\nimport kernel\n"
+        "from kernel_case_suite import bind_kernel_call\n"
+        "bind_kernel_call(kernel.kernel_function, torch.nn.Identity(), [torch.randn(2)])\n",
+    ):
+        validate_test_kernel_call_binding(source)
