@@ -724,3 +724,36 @@ def test_seed_rejects_same_keywords_with_different_computation(tmp_path):
         outcome="generated", kernel_code="source", verified=True,
     ))
     assert store.search_verified_seeds(changed, "musa", "musa") == []
+
+
+def test_conv_transpose_is_classified_as_convolution():
+    # Regression: "transpose" used to win the first-match keyword scan over
+    # "convolution" because ConvTranspose2d/3d document a "transposed
+    # convolution", routing the prompt to the tensor-transpose template (whose
+    # permutation/stride guidance is wrong for a deconvolution).
+    description = '''
+    class Model(nn.Module):
+        """Performs a transposed 2D convolution."""
+        def forward(self, x, weight, bias):
+            return torch.nn.functional.conv_transpose2d(x, weight, bias, 1, 0, 0)
+    '''
+    assert build_operator_signature(description).semantic_type == "convolution"
+    conv3d = '''
+    class Model(nn.Module):
+        """Performs a transposed 3D convolution."""
+        def forward(self, x, weight, bias):
+            return torch.nn.functional.conv_transpose3d(x, weight, bias, 1, 0, 0)
+    '''
+    assert build_operator_signature(conv3d).semantic_type == "convolution"
+    # Operators that legitimately say "transposed" in another sense must keep
+    # their own family.
+    assert build_operator_signature(
+        "class Model(nn.Module):\n"
+        "    def forward(self, A, B):\n"
+        "        return torch.matmul(A.t(), B)\n"
+    ).semantic_type == "matmul"
+    assert build_operator_signature(
+        "class Model(nn.Module):\n"
+        "    def forward(self, x):\n"
+        "        return x.transpose(0, 1)\n"
+    ).semantic_type == "transpose"
