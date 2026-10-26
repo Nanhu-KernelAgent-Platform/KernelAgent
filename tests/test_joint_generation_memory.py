@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from triton_kernel_agent.agent import TritonKernelAgent
+from triton_kernel_agent.llm_truncation import LLMCallResult
 from triton_kernel_agent.experience import ExperienceRecord, SQLiteExperienceStore, build_operator_signature
 from triton_kernel_agent.experience import generation
 
@@ -102,9 +103,12 @@ def test_agent_prompt_and_child_completion_audit(memory):
     agent._platform_config=SimpleNamespace(name='musa');agent._kernel_backend=SimpleNamespace(name='musa')
     agent.experience_store=store;agent.prompt_manager=Mock()
     agent.prompt_manager.render_kernel_generation_prompt.return_value='BASE REQUIRED OUTPUT FORMAT'
-    agent._call_llm=Mock(return_value='generated');agent._extract_kernel_payload=Mock(return_value='candidate')
+    agent._call_llm=Mock(return_value='generated')
+    agent._call_llm_detailed=Mock(return_value=LLMCallResult('generated', None, None))
+    agent._extract_kernel_payload=Mock(return_value='candidate')
     assert agent._generate_kernel_seeds(SOURCE,'test',execution_direction='joint')==['candidate']
-    prompt=agent._call_llm.call_args.args[0][0]['content']
+    # The seed path calls the signal-carrying variant; audit the prompt there.
+    prompt=agent._call_llm_detailed.call_args.args[0][0]['content']
     assert 'BASE REQUIRED OUTPUT FORMAT' in prompt
     assert 'FORWARD LESSON' in prompt and 'BACKWARD LESSON' in prompt and 'JOINT CODE' in prompt
     assert 'FORWARD CODE' not in prompt and 'BACKWARD CODE' not in prompt
