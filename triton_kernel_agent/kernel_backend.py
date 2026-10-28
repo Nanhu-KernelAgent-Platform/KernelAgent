@@ -194,6 +194,43 @@ def extract_kernel_bundle(response_text: str) -> KernelBundle | None:
     )
 
 
+
+_MUSA_DISPATCH_DTYPES = {
+    "AT_DISPATCH_FLOATING_TYPES": {"float", "double"},
+    "AT_DISPATCH_FLOATING_TYPES_AND2": {"float", "double"},
+    "AT_DISPATCH_FLOATING_TYPES_AND_HALF": {"float", "double", "half"},
+}
+_INSTANTIATION_RE = re.compile(
+    r"template[ \t]+void[ \t]+([A-Za-z_][\w:]*)[ \t]*<[ \t]*(float|double|half)[ \t]*>"
+)
+
+
+def _dispatch_dtypes(binding_cpp: str) -> set[str]:
+    """Dtypes reached by the AT_DISPATCH macro(s) used in binding.cpp."""
+    found: set[str] = set()
+    for macro, dtypes in _MUSA_DISPATCH_DTYPES.items():
+        # Skip *_AND2/_AND_HALF matches when only the bare macro appears.
+        if re.search(rf"\b{macro}\b", binding_cpp):
+            found |= dtypes
+    return found
+
+
+def _instantiated_dtypes(kernel_mu: str) -> set[str] | None:
+    """Dtypes with an explicit ``template void launch_x<dtype>(...)``.
+
+    ``None`` means the bundle does not use the template-instantiation pattern at
+    all (plain overloads, macros, etc.), so there is nothing to compare.
+    """
+    matches = _INSTANTIATION_RE.findall(kernel_mu)
+    if not matches:
+        return None
+    return {dtype for _name, dtype in matches}
+
+
+def _instantiated_names(kernel_mu: str) -> set[str]:
+    return {name for name, _dtype in _INSTANTIATION_RE.findall(kernel_mu)}
+
+
 # Builtin identifiers that MUSA/CUDA kernels may use, permitted only inside a
 # ``__global__`` kernel body (never in a host ``launch_*`` wrapper).
 _MUSA_DEVICE_BUILTIN_TOKENS = (
@@ -304,6 +341,29 @@ def validate_musa_bundle_semantics(bundle: KernelBundle) -> str | None:
                     f"kernel body (e.g. in host launch_* glue); move the "
                     f"computation into a __global__ kernel function"
                 )
+
+    # 5. Dispatch dtype set must equal the instantiated dtype set.
+    # Observed on conv_transpose1d (P74): binding.cpp used
+    # AT_DISPATCH_FLOATING_TYPES (float AND double) while kernel.mu only
+    # instantiated <float>, so the module failed at import with
+    # "undefined symbol: launch_conv_transpose1d<double>". A "keep the output
+    # short by skipping double" instruction used to make this frequent, so the
+    # pair is checked here instead of trusted to the prompt.
+    dispatch_dtypes = _dispatch_dtypes(binding_cpp)
+    instantiated = _instantiated_dtypes(kernel_mu)
+    if dispatch_dtypes and instantiated is not None:
+        missing = sorted(dispatch_dtypes - instantiated)
+        if missing:
+            names = ", ".join(sorted(_instantiated_names(kernel_mu))[:3]) or "launch_*"
+            return (
+                f"kernel.mu instantiates no <{'>, <'.join(missing)}> launcher but "
+                f"binding.cpp dispatches with AT_DISPATCH_FLOATING_TYPES, which "
+                f"reaches {', '.join(sorted(dispatch_dtypes))}. Add the missing "
+                f"explicit instantiation(s) for {names} (e.g. "
+                f"'template void {names.split(', ')[0]}<{missing[0]}>(') or narrow "
+                f"the dispatch to the dtypes kernel.mu instantiates; otherwise the "
+                f"module fails at import with 'undefined symbol'."
+            )
 
     return None
 

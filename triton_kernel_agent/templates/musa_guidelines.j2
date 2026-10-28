@@ -5,6 +5,23 @@ Generate a native MUSA extension bundle.
   builtins or process exits to affect tests. Input-transfer/test setup failures
   must be repaired in the test, never through global side effects in kernel.py.
 - kernel.py must expose kernel_function and load the extension built by setup.py.
+- PARAMETER CONTRACT (binding): declare ONLY parameters the reference model
+  actually has. `bind_kernel_call` binds by name against the model's
+  named_parameters/named_buffers, then the module attributes (kernel_size,
+  stride, padding, dilation, output_padding, groups, eps, num_groups, ...), then
+  positionally from get_inputs(). A reference constructed with bias=False has no
+  bias parameter, so a REQUIRED `bias` argument raises
+  "Cannot bind required kernel parameter(s): bias" before any kernel runs.
+  If you need a bias slot at all, give it a default (bias=None); never make it
+  required when the model has none.
+- HYPER-PARAMETER TYPES: PyTorch normalizes conv-style scalars when the
+  reference module is constructed, so the BOUND values are tuples:
+  kernel_size=(5,), stride=(1,), padding=(0,), dilation=(3,),
+  output_padding=(0,) -- while groups stays an int. Never assume these are ints
+  and never do arithmetic on two tuples. Normalize in kernel.py first, e.g.
+  `k = kernel_size[0] if isinstance(kernel_size, (tuple, list)) else kernel_size`,
+  and pass plain ints to the launcher.
+
 - setup.py must use torch_musa.utils.musa_extension.MUSAExtension and BuildExtension.
 - Keep extra_compile_args minimal and portable: 'cxx': ['-O3', '-std=c++17'] and
   'mcc': ['-O3']. Do NOT pass nvcc-only options such as --expt-relaxed-constexpr,

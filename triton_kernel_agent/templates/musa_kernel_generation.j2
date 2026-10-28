@@ -47,9 +47,14 @@ truncates anything longer and the run fails. To fit:
    no plan, no restatement of the problem, before or after the blocks.
 2. Comments: at most one short header comment per file (<= 5 comment lines
    total per file). The code itself is the deliverable.
-3. Instantiate only the dtypes the test file actually exercises. Do NOT add
-   float64 support "just in case": extra dtype instantiations are dead code
-   that burns the output budget and verification never exercises them.
+3. Keep dispatch and instantiations consistent: the dtype SET that binding.cpp
+   dispatches must equal the dtype SET kernel.mu instantiates. With
+   AT_DISPATCH_FLOATING_TYPES you MUST emit BOTH
+   `template void launch_x<float>(...)` and `template void launch_x<double>(...)`.
+   If you only want float, narrow the dispatch (e.g. a float-only branch) AND
+   instantiate only float. Either way the two sets must match exactly: a dtype
+   the dispatch reaches with no matching instantiation fails at import with
+   "undefined symbol: launch_x<double>".
 4. setup.py: copy the canonical shape below, changing only the extension
    name. Do not hand-write a longer variant.
 
