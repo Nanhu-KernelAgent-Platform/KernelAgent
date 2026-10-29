@@ -544,6 +544,15 @@ class VerificationWorker:
             return ""
         return fragment[-2000:]
 
+    def _reference_requires_chunking(self) -> bool:
+        """True when the explicit case suite had to evaluate its reference in chunks.
+
+        Chunking only happens when the reference output exceeds the MUSA int32 element
+        limit (2**31); a full-shape reference there silently returns zeros, so a
+        generated test comparing against a full-shape reference cannot be authoritative.
+        """
+        return any(row.get("reference_chunked") for row in self.last_case_results)
+
     def _run_test(self) -> tuple[bool, str, str]:
         """
         Run the explicit companion first, then remaining scripts sequentially.
@@ -614,6 +623,14 @@ class VerificationWorker:
                     )
                     return False, result.stdout, result.stderr
                 self.logger.info("Test %s passed", test_file.name)
+                if self._reference_requires_chunking():
+                    self.logger.info(
+                        "Skipping remaining generated tests for %s: the explicit case suite passed with a "
+                        "chunked reference (an output of >= 2**31 elements is unsupported as a full-shape "
+                        "MUSA reference), so a full-shape comparison in a generated test is not authoritative",
+                        test_file.name,
+                    )
+                    return True, result.stdout, result.stderr
 
             return True, result.stdout, result.stderr
 

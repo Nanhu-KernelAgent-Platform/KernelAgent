@@ -314,6 +314,7 @@ def verify_cases(problem, kernel, device, direction="forward"):
                 saved.append(describe(tensor))
                 return tensor
             slices = reference_slices(model, inputs) if direction != "backward" else [slice(None)]
+            result["reference_chunked"] = len(slices) > 1
             with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
                 if len(slices) == 1:
                     expected = model(*inputs)
