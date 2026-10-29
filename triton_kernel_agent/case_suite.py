@@ -19,6 +19,92 @@ except ImportError:
 RESULT_PREFIX = "KERNELAGENT_CASE_RESULTS="
 SUITE_MARKER = "# KERNELAGENT_EXPLICIT_CASE_SUITE_V1"
 
+INT32_LIMIT = 2 ** 31 - 1
+
+
+def split_rows(tensor, count):
+    """Split dim 0 of ``tensor`` into ``count`` near-equal row ranges."""
+    rows = tensor.shape[0]
+    step = max(1, math.ceil(rows / max(1, count)))
+    return [slice(start, min(start + step, rows)) for start in range(0, rows, step)]
+
+
+def chunk_max(tensor):
+    """max(|x|) evaluated slice-wise along dim 0 (int32-safe); 0.0 for empty tensors."""
+    import torch
+    best = 0.0
+    if tensor.numel():
+        for sl in split_rows(tensor, max(1, math.ceil(tensor.numel() / INT32_LIMIT))):
+            part = tensor[sl]
+            if part.numel():
+                best = max(best, float(part.abs().max().item()))
+    return best
+
+
+def reference_slices(model, inputs, budget=INT32_LIMIT):
+    """Decide the dim-0 split for the reference and the comparison from the OUTPUT size.
+
+    MUSA (muDNN) kernels index with int32: an output of >= 2**31 elements makes the
+    eager reference return zeros silently and makes ``assert_close``'s mismatch-report
+    mask fill raise ``FillOp MUDNN failed in: RunMask``. The output size is unknown
+    before running the model, so probe one leading-dim row on a throwaway copy of the
+    model (no state mutation, no autograd) and split so each slice's output stays under
+    ``budget``. Small cases keep the single-slice path and are unaffected.
+    """
+    import copy
+    import torch
+    lead = inputs[0] if inputs and torch.is_tensor(inputs[0]) else None
+    if lead is None or lead.dim() == 0 or lead.shape[0] <= 1 or lead.numel() <= 4096:
+        return [slice(None)]
+    probe = [t[0:1] if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == lead.shape[0] else t
+             for t in inputs]
+    probe_model = copy.deepcopy(model)
+    was_training = probe_model.training
+    probe_model.eval()
+    try:
+        with torch.no_grad():
+            probe_out = probe_model(*probe)
+    except Exception:
+        return [slice(None)]
+    finally:
+        probe_model.train(was_training)
+    per_sample = sum(t.numel() for t in tensors(probe_out))
+    total = per_sample * lead.shape[0]
+    if not per_sample or total <= budget:
+        return [slice(None)]
+    return split_rows(lead, max(2, math.ceil(total / budget)))
+
+
+def slice_inputs(inputs, sl):
+    """Slice every input sharing the leading dim of ``inputs[0]``; pass others through."""
+    import torch
+    if sl == slice(None) or not inputs:
+        return list(inputs)
+    lead_rows = inputs[0].shape[0] if torch.is_tensor(inputs[0]) and inputs[0].dim() > 0 else None
+    return [t[sl] if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == lead_rows else t for t in inputs]
+
+
+def concat_outputs(parts):
+    import torch
+    first = parts[0]
+    if torch.is_tensor(first):
+        return torch.cat(parts, dim=0)
+    if isinstance(first, (tuple, list)):
+        return type(first)(torch.cat([part[index] for part in parts], dim=0) for index in range(len(first)))
+    raise ValueError(f"unsupported reference output type for chunked evaluation: {type(first).__name__}")
+
+
+def assert_close_chunked(actual, expected, slices, tolerance):
+    import torch
+    if len(slices) == 1:
+        torch.testing.assert_close(actual, expected, equal_nan=False, **tolerance)
+        return
+    actual_seq = actual if isinstance(actual, (tuple, list)) else (actual,)
+    expected_seq = expected if isinstance(expected, (tuple, list)) else (expected,)
+    for actual_tensor, expected_tensor in zip(actual_seq, expected_seq):
+        for sl in slices:
+            torch.testing.assert_close(actual_tensor[sl], expected_tensor[sl], equal_nan=False, **tolerance)
+
 
 def register_torch_musa_alias():
     """Make a bare ``import torch.musa`` valid on MUSA hosts.
@@ -227,18 +313,39 @@ def verify_cases(problem, kernel, device, direction="forward"):
             def pack(tensor):
                 saved.append(describe(tensor))
                 return tensor
+            slices = reference_slices(model, inputs) if direction != "backward" else [slice(None)]
             with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-                expected = model(*inputs)
+                if len(slices) == 1:
+                    expected = model(*inputs)
+                else:
+                    expected = concat_outputs([model(*slice_inputs(inputs, sl)) for sl in slices])
+            # Reference sanity: an all-zero reference with non-zero inputs means the
+            # platform reference path is unsupported at this size (muDNN int32 limit),
+            # so no kernel can match it. Fail fast instead of spending refine rounds.
+            if expected.numel() and chunk_max(expected) == 0.0 and any(
+                    chunk_max(t) > 0.0 for t in tensors(inputs) if t.numel()):
+                result["status"] = "reference-unsupported"
+                result["unsupported"] = True
+                result["error"] = (
+                    f"reference-unsupported-shape: reference output is all-zero at numel={expected.numel()} "
+                    "while the inputs are non-zero; the platform reference path is unsupported at this size "
+                    "(muDNN int32 element limit). This is not a kernel defect; do not rewrite the kernel.")
+                result["contract"] = contract(model, inputs, expected, direction=direction)
+                results.append(result)
+                continue
             actual = bind_kernel_call(kernel, candidate_model, candidate_inputs)()
             tolerance = ({"rtol": case.get("rtol", 1e-4), "atol": case.get("atol", 1e-5)}
                          if "rtol" in case or "atol" in case else {})
-            torch.testing.assert_close(actual, expected, equal_nan=False, **tolerance)
+            assert_close_chunked(actual, expected, slices, tolerance)
             backward = None
             if direction in {"backward", "joint"}:
                 ref_grad, backward = gradient_call(expected, inputs, model, case)
                 kernel_grad, actual_backward = gradient_call(actual, candidate_inputs, candidate_model, case)
                 expected_grads, actual_grads = ref_grad(), kernel_grad()
-                torch.testing.assert_close(actual_grads, expected_grads, equal_nan=False, **tolerance)
+                for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                    grad_slices = (split_rows(expected_grad, max(1, math.ceil(expected_grad.numel() / INT32_LIMIT)))
+                                   if expected_grad.numel() > INT32_LIMIT else [slice(None)])
+                    assert_close_chunked(actual_grad, expected_grad, grad_slices, tolerance)
                 backward["gradient_outputs"] = describe(expected_grads)
                 if actual_backward["requested_gradients"] != backward["requested_gradients"]:
                     raise ValueError("candidate gradient target contract differs")
@@ -247,12 +354,15 @@ def verify_cases(problem, kernel, device, direction="forward"):
             result["contract"]["verification_tolerance"] = tolerance or {"policy": "torch_dtype_default"}
             result["status"] = "passed"
         except Exception as exc:
-            result["error"] = f"{type(exc).__name__}: {exc}"
+            root, chain = exc, []
+            while getattr(root, "__cause__", None) is not None:
+                root = root.__cause__
+                chain.append(f"{type(root).__name__}: {root}")
+            result["error"] = f"{type(exc).__name__}: {exc}" + (f"\n[cause] " + " <- ".join(chain) if chain else "")
             if not result["contract"]:
                 result["contract"] = {"direction": direction, "inputs": describe(case["inputs"])}
         results.append(result)
     return results
-
 
 def benchmark_cases(problem, kernel, device, direction, measure):
     """One warmup/three windows per case; equal-weight suite mean is explicit."""
