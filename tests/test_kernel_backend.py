@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -165,3 +166,38 @@ def test_bundle_writes_are_safe_under_workdir(tmp_path: Path):
     for name, content in bundle.files.items():
         (tmp_path / name).write_text(content)
     assert (tmp_path / "kernel.py").is_file()
+
+
+def test_musa_extension_entry_named_after_a_torch_method_is_not_a_fallback(tmp_path):
+    """KernelBench L1 #4: ``ext.matmul(A, B)`` must not be read as ``Tensor.matmul``."""
+    (tmp_path / "work").mkdir()
+    (tmp_path / "logs").mkdir()
+    worker = VerificationWorker(
+        worker_id=0,
+        workdir=tmp_path / "work",
+        log_dir=tmp_path / "logs",
+        target_platform="musa",
+        kernel_backend="musa",
+    )
+    wrapper = ("import torch\nimport matvec_kernel\n\ndef kernel_function(A, B):\n"
+               "    return matvec_kernel.matmul(A, B)\n")
+    bundle = KernelBundle({"kernel.py": wrapper, "binding.cpp": "// binding",
+                           "kernel.mu": "// native kernel", "setup.py": "# setup"})
+    assert worker._detect_pytorch_compute(bundle) is None
+
+    # A real PyTorch fallback stays rejected even on MUSA.
+    for source, expected in (
+        ("import torch\ndef kernel_function(A, B):\n    return torch.matmul(A, B)\n", "tensor-tensor ops"),
+        ("import torch\ndef kernel_function(x):\n    return torch.nn.functional.relu(x)\n", "torch.nn"),
+    ):
+        rejected = KernelBundle({"kernel.py": source, "binding.cpp": "// binding",
+                                 "kernel.mu": "// native kernel", "setup.py": "# setup"})
+        assert worker._detect_pytorch_compute(rejected) is not None
+        assert expected in worker._detect_pytorch_compute(rejected)
+
+
+def test_triton_backend_still_rejects_tensor_matmul_method():
+    worker = VerificationWorker.__new__(VerificationWorker)
+    worker._kernel_backend = SimpleNamespace(name="triton")
+    source = "def kernel_function(A, B):\n    return A.matmul(B)\n"
+    assert "Tensor.matmul" in worker._detect_pytorch_compute(source)

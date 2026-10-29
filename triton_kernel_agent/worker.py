@@ -131,6 +131,22 @@ DISALLOWED_TORCH_PATTERNS = [
     ),
 ]
 
+# Native MUSA wrappers must call the compiled extension entry point, and the
+# generated entry name is the model's choice, so a name that collides with a
+# torch method (``matmul``/``mm``/``bmm``/``forward``) is a legitimate extension
+# call, not a PyTorch fallback. KernelBench L1 #4 hit exactly that: MusaCoder
+# named the pybind entry ``matmul`` and ``matvec_kernel.matmul(A, B)`` was caught
+# by the receiver-agnostic ``.(matmul|mm|bmm)(`` rule, which then deadlocked the
+# refine loop because the error text never reveals that the name is the problem.
+# The torch-prefixed bans above still reject ``torch.matmul``/``torch.mm``/
+# ``torch.bmm``/``torch.einsum`` and every torch.nn/.functional path, so this
+# exemption stops the method-call heuristic from misfiring on extension entry
+# names; it does not permit a PyTorch compute fallback.
+MUSA_EXTENSION_ENTRY_PATTERNS = frozenset({
+    r"\.forward\(",
+    r"\.(matmul|mm|bmm)\s*\(",
+})
+
 
 # ``torch.musa`` is a backend attribute created by ``import torch_musa``; it is
 # not an importable submodule, so ``import torch.musa`` / ``from torch.musa``
@@ -520,7 +536,7 @@ class VerificationWorker:
             # extension entry point (commonly ``extension.forward(...)``).
             # The remaining torch.nn and tensor-compute bans still prevent a
             # PyTorch fallback from bypassing native kernel execution.
-            if self._kernel_backend.name == "musa" and pattern.pattern == r"\.forward\(":
+            if self._kernel_backend.name == "musa" and pattern.pattern in MUSA_EXTENSION_ENTRY_PATTERNS:
                 continue
             if pattern.search(sanitized):
                 return message
