@@ -268,3 +268,67 @@ def test_runtime_contract_mismatch_does_not_get_verified_timing(tmp_path):
     with store._connect() as connection:
         attempt = run_report(connection, run_id)["attempts"][0]
     assert next(row for row in attempt["measurements"] if row["case_key"] == "default")["verified"] == 0
+
+
+# --- Verification-gate tolerance: KernelBench official 1e-2 for long reductions ---
+TOLERANCE_SOURCE = '''import torch
+class Model(torch.nn.Module):
+    def forward(self, A, B):
+        return torch.matmul(A, B)
+def get_inputs():
+    return [torch.full((8, 64), 4.0), torch.full((64, 1), 4.0)]
+def get_init_inputs():
+    return []
+'''
+
+# Reference value is exactly 1024.0, so a 3e-6 relative deviation (0.0031) is far
+# outside torch's fp32 default (atol 1e-5 + rtol 1.3e-6*1024) but far inside the
+# KernelBench fp32 standard (atol 1e-2 + rtol 1e-2*1024).
+def slightly_off_matmul(A, B):
+    return torch.matmul(A, B) * (1 + 3e-6)
+
+
+def zero_matmul(A, B):
+    return torch.zeros(A.shape[0], B.shape[1])
+
+
+def test_default_case_keeps_torch_dtype_tolerance_without_override(monkeypatch):
+    for name in ("KERNELAGENT_VERIFY_RTOL", "KERNELAGENT_VERIFY_ATOL",
+                 "KERNELAGENT_VERIFY_TOLERANCE_POLICY"):
+        monkeypatch.delenv(name, raising=False)
+    rows = verify_cases(problem(TOLERANCE_SOURCE), slightly_off_matmul, "cpu")
+    assert rows[0]["status"] == "failed"
+    assert "1.3e-06" in rows[0]["error"]
+
+
+def test_kernelbench_tolerance_env_accepts_reduction_order_noise(monkeypatch):
+    monkeypatch.setenv("KERNELAGENT_VERIFY_RTOL", "0.01")
+    monkeypatch.setenv("KERNELAGENT_VERIFY_ATOL", "0.01")
+    monkeypatch.setenv("KERNELAGENT_VERIFY_TOLERANCE_POLICY", "kernelbench_official_fp32")
+    rows = verify_cases(problem(TOLERANCE_SOURCE), slightly_off_matmul, "cpu")
+    assert [row["status"] for row in rows] == ["passed"]
+    assert rows[0]["contract"]["verification_tolerance"] == {
+        "rtol": 0.01, "atol": 0.01, "policy": "kernelbench_official_fp32"}
+
+
+def test_explicit_case_tolerance_still_overrides_the_env_default(monkeypatch):
+    monkeypatch.setenv("KERNELAGENT_VERIFY_RTOL", "0.01")
+    monkeypatch.setenv("KERNELAGENT_VERIFY_ATOL", "0.01")
+    monkeypatch.setenv("KERNELAGENT_VERIFY_TOLERANCE_POLICY", "kernelbench_official_fp32")
+    source = TOLERANCE_SOURCE + '''def get_test_cases():
+    return [{"case_key": "strict", "inputs": [torch.full((8, 64), 4.0), torch.full((64, 1), 4.0)],
+             "rtol": 0, "atol": 0}]
+'''
+    rows = verify_cases(problem(source), slightly_off_matmul, "cpu")
+    by_key = {row["case_key"]: row for row in rows}
+    assert by_key["default"]["status"] == "passed"
+    assert by_key["strict"]["status"] == "failed"
+    assert by_key["default"]["contract"]["verification_tolerance"]["policy"] == "kernelbench_official_fp32"
+
+
+def test_all_zero_candidate_is_never_excused_by_a_loose_tolerance(monkeypatch):
+    monkeypatch.setenv("KERNELAGENT_VERIFY_RTOL", "0.01")
+    monkeypatch.setenv("KERNELAGENT_VERIFY_ATOL", "0.01")
+    rows = verify_cases(problem(TOLERANCE_SOURCE), zero_matmul, "cpu")
+    assert rows[0]["status"] == "failed"
+    assert "all-zero" in rows[0]["error"]

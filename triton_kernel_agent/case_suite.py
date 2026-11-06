@@ -9,6 +9,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 from statistics import median
 
 try:
@@ -20,6 +21,58 @@ RESULT_PREFIX = "KERNELAGENT_CASE_RESULTS="
 SUITE_MARKER = "# KERNELAGENT_EXPLICIT_CASE_SUITE_V1"
 
 INT32_LIMIT = 2 ** 31 - 1
+
+# Verification-gate tolerance for the implicit ``default`` case. Without an
+# override it inherits torch's dtype defaults (fp32: rtol=1.3e-6, atol=1e-5),
+# which a long fp32 reduction cannot meet even when it is numerically correct: a
+# summation order that differs from the eager reference alone costs ~12-14 ULP
+# (KernelBench L1 #4, a 1M-element fp32 dot product, lands at 1.4-1.7e-6).
+# KernelBench scores correctness at atol=rtol=1e-2
+# (KernelBench/src/kernelbench/eval.py), so the bridge supplies that standard for
+# KernelBench sources only and restores the previous values afterwards.
+TOLERANCE_ENV = {"rtol": "KERNELAGENT_VERIFY_RTOL", "atol": "KERNELAGENT_VERIFY_ATOL"}
+TOLERANCE_POLICY_ENV = "KERNELAGENT_VERIFY_TOLERANCE_POLICY"
+
+
+def default_tolerance():
+    """Tolerance override for cases that declare none; ``{}`` when unset."""
+    overrides = {}
+    for key, name in TOLERANCE_ENV.items():
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a finite nonnegative number, got {raw!r}")
+        overrides[key] = value
+    return overrides
+
+
+def tolerance_policy(overrides):
+    """Provenance label recorded in the contract next to the tolerance in force."""
+    if not overrides:
+        return "torch_dtype_default"
+    return os.environ.get(TOLERANCE_POLICY_ENV) or "env_explicit"
+
+
+def is_all_zero(value):
+    """True when every tensor in ``value`` is entirely zero (int32-safe, chunked)."""
+    import torch
+    found = tensors(value)
+    if not found:
+        return False
+    for tensor in found:
+        if tensor.numel() == 0:
+            continue
+        if tensor.is_floating_point() or tensor.is_complex():
+            if chunk_max(tensor) != 0.0:
+                return False
+        elif bool(tensor.any().item()):
+            return False
+    return True
 
 
 def split_rows(tensor, count):
@@ -182,6 +235,8 @@ def load_cases(problem):
         if not isinstance(extra, (list, tuple)) or len(extra) > 15:
             raise ValueError("get_test_cases must return at most 15 explicit case dictionaries")
         cases.extend(extra)
+    overrides = default_tolerance()
+    policy = tolerance_policy(overrides)
     seen = set()
     normalized = []
     for raw in cases:
@@ -197,6 +252,12 @@ def load_cases(problem):
             if name == "inputs" and name not in case:
                 raise ValueError("each explicit case requires inputs")
             case[name] = list(values) if isinstance(values, (tuple, list)) else [values]
+        # A case that declares no tolerance inherits the caller-supplied standard;
+        # a case that declares its own keeps it and reports that provenance.
+        declared = any(name in case for name in ("rtol", "atol"))
+        for name, value in overrides.items():
+            case.setdefault(name, value)
+        case["tolerance_policy"] = "explicit_case" if declared else policy
         for name in ("rtol", "atol"):
             if name in case and (isinstance(case[name], bool) or not isinstance(case[name], (int, float))
                                  or not math.isfinite(case[name]) or case[name] < 0):
@@ -335,6 +396,13 @@ def verify_cases(problem, kernel, device, direction="forward"):
                 results.append(result)
                 continue
             actual = bind_kernel_call(kernel, candidate_model, candidate_inputs)()
+            # A collapsed (all-zero) candidate must never be excused by a loose
+            # tolerance: atol=1e-2 would otherwise accept a kernel that returns
+            # zeros for every element.
+            if is_all_zero(actual) and not is_all_zero(expected):
+                raise AssertionError(
+                    "candidate output is all-zero while the reference is not; a collapsed output cannot be "
+                    f"excused by the verification tolerance (policy: {case.get('tolerance_policy')})")
             tolerance = ({"rtol": case.get("rtol", 1e-4), "atol": case.get("atol", 1e-5)}
                          if "rtol" in case or "atol" in case else {})
             assert_close_chunked(actual, expected, slices, tolerance)
@@ -352,7 +420,9 @@ def verify_cases(problem, kernel, device, direction="forward"):
                     raise ValueError("candidate gradient target contract differs")
             result["contract"] = contract(model, inputs, expected, direction=direction,
                                           backward=backward, saved_state=saved)
-            result["contract"]["verification_tolerance"] = tolerance or {"policy": "torch_dtype_default"}
+            result["contract"]["verification_tolerance"] = (
+                {**tolerance, "policy": case.get("tolerance_policy") or "torch_dtype_default"}
+                if tolerance else {"policy": "torch_dtype_default"})
             result["status"] = "passed"
         except Exception as exc:
             root, chain = exc, []
