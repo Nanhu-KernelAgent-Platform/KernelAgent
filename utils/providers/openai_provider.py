@@ -31,6 +31,13 @@ class OpenAIProvider(OpenAICompatibleProvider):
 
     def get_max_tokens_limit(self, model_name: str) -> int:
         """Get the output-token limit used by KernelAgent requests."""
+        if 'deepseek' in model_name.lower():
+            # DeepSeek-V4.1-Flash burns much of its completion budget on
+            # reasoning_tokens before content, so the 8192 registry default
+            # left content empty and every MUSA seed failed with
+            # 'no FILE block recognized'. The lab MaaS gateway accepts
+            # max_tokens=32768 (probed: finish=stop), so request that.
+            return 32768
         if "musacoder" in model_name.lower():
             # A complete 4-file native MUSA bundle (kernel.py, binding.cpp,
             # kernel.mu, setup.py) for a forward+backward operator exceeds
