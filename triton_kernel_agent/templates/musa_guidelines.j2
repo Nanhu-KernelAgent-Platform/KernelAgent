@@ -49,6 +49,18 @@ Generate a native MUSA extension bundle.
   instantiate them for you: it only instantiates what it can see in binding.cpp.
   Simplest alternative that also avoids the problem: make the launcher a
   non-template function that switches on the dtype itself.
+- Dynamic shared memory in a templated kernel
+  `extern __shared__ scalar_t smem[];` is illegal when the kernel is instantiated twice.
+  mcc: "redeclaration of smem with a different type: double[] vs float[]".
+  Fix: declare one concrete type (float smem[]) or extern __shared__ char raw[], then cast.
+- Size the dynamic shared-memory launch argument in bytes: count * sizeof(float).
+- CONSTANTS ARE NOT PARAMETERS: keep the signature to model tensors and get_inputs() values.
+  stride/padding/dilation/output_padding/kernel_size/groups/eps/scaling/output sizes are NOT parameters.
+  Bake them as constants in kernel.py; bind_kernel_call cannot supply them.
+- REDUCTION DOMAIN AND LIVE INTERMEDIATES
+  GroupNorm normalizes over (channels_per_group, H, W); logsumexp(dim=1) reduces every channel.
+  A per-output-row block sees only W values: add a statistics pass, or use one block per group.
+  Never overwrite an intermediate a later op reads: residual add needs the pre-norm conv output.
 - Do not invent PyTorch C++ API names. `torch::kContiguous`,
   `torch::kFloat32`, `at::musa::...` helpers you are unsure about do not exist.
   For the output just reuse `A.options()` (optionally `.dtype(A.scalar_type())`)
