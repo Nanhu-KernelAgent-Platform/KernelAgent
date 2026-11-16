@@ -398,6 +398,63 @@ def _count_cpp_arguments(arguments: str) -> int:
     return count
 
 
+# --- A1: helpers building a copy-verbatim expected instantiation line ---
+_KNOWN_TYPE_WORDS = {
+    "const", "void", "bool", "char", "short", "int", "long", "unsigned",
+    "signed", "float", "double", "half", "size_t", "int8_t", "int16_t",
+    "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "dim3", "scalar_t", "ptrdiff_t",
+}
+_INSTANTIATION_DTYPE_RE = re.compile(
+    r"template\s+(?!<)[^<>;{]*?\b(\w+)\s*<\s*([A-Za-z_]\w*)\s*>\s*\(([^()]*)\)\s*;", re.S)
+
+
+def _split_cpp_arguments(arguments: str) -> list[str]:
+    """Split a top-level C++ parameter list, ignoring nested <(...)>/{...}."""
+    text = arguments.strip()
+    if text in ("", "void"):
+        return []
+    parts, depth, start = [], 0, 0
+    for idx, char in enumerate(text):
+        if char in "<([{":
+            depth += 1
+        elif char in ">)]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:idx])
+            start = idx + 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _strip_param_name(param: str) -> str:
+    """Drop the trailing parameter identifier, e.g. 'const float* input' -> 'const float*'.
+
+    Conservative: only strips when the trailing word is not a known type keyword,
+    so unnamed declarations ('int64_t') and multi-word types ('unsigned long') stay intact.
+    """
+    param = param.strip()
+    stripped = re.sub(r"(?<![A-Za-z0-9_:])\s*([A-Za-z_]\w*)\s*$", "", param, count=1)
+    tail = re.search(r"([A-Za-z_]\w*)\s*$", param)
+    if not tail or tail.group(1) in _KNOWN_TYPE_WORDS:
+        return param
+    return stripped.rstrip()
+
+
+def _expected_instantiation_line(name: str, dtype: str, declared_params: str) -> str | None:
+    """Build the exact `template void name<dtype>(...);` line mcc expects (best-effort)."""
+    args = []
+    for param in _split_cpp_arguments(declared_params):
+        if "scalar_t" in param:
+            param = re.sub(r"\bscalar_t\b", dtype, param)
+        elif "..." in param or "=" in param:
+            return None  # can't be represented safely -> caller stays fail-open
+        args.append(_strip_param_name(param))
+    if not args:
+        return None
+    return f"template void {name}<{dtype}>({', '.join(args)});"
+
+
 def validate_template_instantiations(
     kernel_code: str | KernelBundle | Mapping[str, str],
 ) -> str | None:
@@ -449,11 +506,93 @@ def validate_template_instantiations(
             if passed_count == declared_count:
                 continue
             line = source.count("\n", 0, match.start()) + 1
+            # A1: emit copy-verbatim expected lines for every dtype this file
+            # instantiates so the repair loop can act mechanically. Count-only
+            # messages let models drift (16 -> 18 -> fail, p77/p83/p88).
+            declared_text = next(
+                (
+                    m.group(3)
+                    for m in _TEMPLATE_DECL_RE.finditer(source)
+                    if m.group(2) == name
+                ),
+                "",
+            )
+            expected_lines: list[str] = []
+            if declared_text:
+                for im in _INSTANTIATION_DTYPE_RE.finditer(source):
+                    if im.group(1) != name:
+                        continue
+                    dtype = im.group(2)
+                    if dtype not in ("float", "double", "half"):
+                        continue
+                    expected = _expected_instantiation_line(name, dtype, declared_text)
+                    if expected and expected not in expected_lines:
+                        expected_lines.append(expected)
+            if expected_lines:
+                hint = (
+                    " Copy each expected line below verbatim (only edit the "
+                    "`template void ...;` lines; do NOT modify the template "
+                    "declaration): " + " ".join(f"expected: {e}" for e in expected_lines)
+                )
+            else:
+                hint = (
+                    " Repeat every template parameter in "
+                    f"the 'template void {name}<...>(...)' line, or delete that line: "
+                    "the call sites in binding.cpp already instantiate the template."
+                )
             return (
                 f"{filename}:{line}: explicit instantiation of '{name}' passes "
                 f"{passed_count} arguments but its template declares "
-                f"{declared_count} parameters. Repeat every template parameter in "
-                f"the 'template void {name}<...>(...)' line, or delete that line: "
-                f"the call sites in binding.cpp already instantiate the template."
+                f"{declared_count} parameters.{hint}"
             )
     return None
+
+
+def collect_template_instantiation_arities(
+    kernel_code: str | KernelBundle | Mapping[str, str],
+) -> dict[tuple[str, str], tuple[int, ...]]:
+    """Per trusted template name, sorted unique explicit-instantiation arg counts.
+
+    Same fail-open rules as validate_template_instantiations; the worker uses it
+    to detect an instantiation arity that drifts between repair rounds
+    (p77: 16 -> 18, p83: 23 -> 24, p88: 27 -> 36) and to name the drift.
+    """
+    bundle = (
+        extract_kernel_bundle(kernel_code)
+        if isinstance(kernel_code, str)
+        else kernel_code
+    )
+    if isinstance(bundle, Mapping):
+        files = dict(bundle)
+    elif isinstance(bundle, KernelBundle):
+        files = bundle.files
+    else:
+        return {}
+    out: dict[tuple[str, str], tuple[int, ...]] = {}
+    for filename in _NATIVE_SOURCE_FILES:
+        source = files.get(filename) or ""
+        if not source or _CONDITIONAL_COMPILATION_RE.search(source):
+            continue
+        trusted: set[str] = set()
+        untrusted: set[str] = set()
+        seen: dict[str, set[int]] = {}
+        for match in _TEMPLATE_DECL_RE.finditer(source):
+            template_parameters, name, parameters = match.groups()
+            if not template_parameters.strip():
+                continue  # explicit specialization
+            if "..." in parameters or "..." in template_parameters or "=" in parameters:
+                untrusted.add(name)
+                continue
+            seen.setdefault(name, set()).add(_count_cpp_arguments(parameters))
+        for name, arities in seen.items():
+            if name not in untrusted and len(arities) == 1:
+                trusted.add(name)
+        counts: dict[str, set[int]] = {}
+        for match in _TEMPLATE_INSTANTIATION_RE.finditer(source):
+            name, arguments = match.groups()
+            if name not in trusted:
+                continue
+            counts.setdefault(name, set()).add(_count_cpp_arguments(arguments))
+        for name, values in counts.items():
+            out[(filename, name)] = tuple(sorted(values))
+    return out

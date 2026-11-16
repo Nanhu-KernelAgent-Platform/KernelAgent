@@ -70,6 +70,18 @@ Generate a native MUSA extension bundle.
   arguments than the declared `launch_matmul` takes is a hard compile error.
   Simplest safe shape: declare and define ONE function that takes only pointers
   and ints (no dim3, no stream), and call it with exactly those arguments.
+- When a build or static check rejects an explicit instantiation for an
+  argument-count mismatch, do NOT touch the template declaration. Rewrite only
+  the failing `template void launch_xxx<dtype>(...);` line(s), copying the
+  declaration's parameter list verbatim and substituting `scalar_t` with the
+  concrete dtype. The expected line(s) are printed verbatim in the error
+  message ("expected: template void ...") — copy them exactly.
+- Never add or remove parameters between repair rounds. If the check reports
+  that the instantiation changed from N to M arguments, stop sweeping counts:
+  restore the instantiation to the declaration's arity (N parameters) instead.
+- Every dtype instantiated in binding.cpp needs its own `template void
+  launch_xxx<dtype>(...);` line, and all of them must match the declaration's
+  parameter list exactly.
 - The declaration and the definition MUST be the SAME KIND (template vs
   non-template). Pick ONE of these two shapes and use it on both sides:
     (a) TEMPLATE — kernel.mu: `template <typename scalar_t> void launch_xxx(const

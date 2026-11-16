@@ -11,6 +11,8 @@ against ..." note, so the refinement loop repeated the same off-by-one: two
 fail-open: any arity it cannot pin down is never reported.
 """
 
+import re
+
 import pytest
 
 from triton_kernel_agent.kernel_backend import (
@@ -160,9 +162,23 @@ def test_problem_62_round_2_is_rejected_with_exact_counts():
     assert "launch_conv2d_forward" in reason
     assert "passes 18 arguments" in reason
     assert "declares 19 parameters" in reason
-    # The repair payload must offer a concrete way out.
-    assert "Repeat every template parameter" in reason
-    assert "delete that line" in reason
+    # A1: the repair payload must be copy-verbatim actionable.
+    assert "Copy each expected line" in reason
+    expected = re.findall(
+        r"expected: (template void launch_conv2d_forward<(?:float|double)>\([^;]*\);)",
+        reason,
+    )
+    assert len(expected) == 2
+    assert all(len(e.split(",")) == 19 for e in expected)
+    # The generated lines must themselves validate clean (self-consistency).
+    _assert_expected_lines_round_trip(P62_ROUND_2, expected)
+
+
+def _assert_expected_lines_round_trip(source: str, expected: list[str]) -> None:
+    marker = "template void launch_conv2d_forward"
+    head = source[: source.find(marker)].rstrip()
+    synthetic = head + "\n" + "\n".join(expected) + "\n"
+    assert validate_template_instantiations({"kernel.mu": synthetic}) is None
 
 
 def test_matching_instantiation_is_accepted():
@@ -271,3 +287,30 @@ def test_verification_pass_defers_to_the_tests_when_arity_matches():
     bundle = extract_kernel_bundle(_bundle_text(P62_FIXED))
 
     assert worker._single_verification_pass(bundle) == (True, "ok", "", None)
+
+
+def test_instantiation_drift_is_named_across_rounds():
+    """A2: an instantiation arity that changes between rounds is named explicitly."""
+    from triton_kernel_agent.kernel_backend import KernelBundle
+
+    worker = _worker()
+    worker._run_test = lambda: pytest.fail("the build must not run")
+    decl = (
+        "template <typename scalar_t>\n"
+        "void launch_d(const scalar_t* a, scalar_t* b) { (void)a; (void)b; }\n"
+    )
+
+    def run(inst: str):
+        kernel = KernelBundle(
+            files={
+                "kernel.py": "def kernel_function(x): return x\n",
+                "kernel.mu": decl + inst,
+            }
+        )
+        return worker._single_verification_pass(kernel)
+
+    r1 = run("template void launch_d<float>(const float*, float*, int);\n")
+    assert "Copy each expected line" in r1[2]
+    r2 = run("template void launch_d<float>(const float*, float*, int, int);\n")
+    assert "changed from" in r2[2]
+    assert "did not change" in r2[2]

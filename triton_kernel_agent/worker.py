@@ -32,6 +32,7 @@ from typing import Any
 from triton_kernel_agent.platform_config import get_platform
 from triton_kernel_agent.kernel_backend import (
     KernelBundle,
+    collect_template_instantiation_arities,
     extract_kernel_bundle,
     get_kernel_backend,
     validate_musa_bundle_semantics,
@@ -305,6 +306,10 @@ class VerificationWorker:
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
         self._kernel_backend = get_kernel_backend(kernel_backend)
+        # A2: last seen explicit-instantiation arities per (file, template name),
+        # refreshed every round so an arity that drifts between repair rounds
+        # (p77: 16 -> 18) is named explicitly in the rejection message.
+        self._inst_arities: dict[tuple[str, str], tuple[int, ...]] = {}
 
         # Setup files
         self.kernel_file = self.workdir / "kernel.py"
@@ -1083,9 +1088,29 @@ class VerificationWorker:
 
         if self._kernel_backend.name == "musa":
             reason = validate_template_instantiations(kernel_code)
+            inst_arities = collect_template_instantiation_arities(kernel_code)
             if reason:
+                prev_map = getattr(self, "_inst_arities", {})
+                drift = [
+                    (fn, name, prev, cur)
+                    for (fn, name), cur in inst_arities.items()
+                    if (prev := prev_map.get((fn, name))) is not None
+                    and cur != prev
+                ]
+                if drift:
+                    detail = "; ".join(
+                        f"{fn}: instantiation of '{name}' changed from {prev} to {cur} arguments"
+                        for fn, name, prev, cur in drift
+                    )
+                    reason += (
+                        f" ({detail}. The template declaration itself did not change; "
+                        f"copy its parameter list verbatim instead of adding or "
+                        f"removing arguments.)"
+                    )
+                self._inst_arities = inst_arities
                 self.logger.error(reason)
                 return False, "", reason, None
+            self._inst_arities = inst_arities
 
         from .case_suite import SUITE_MARKER
         has_suite = any(SUITE_MARKER in path.read_text() for path in self.test_files if path.exists())
