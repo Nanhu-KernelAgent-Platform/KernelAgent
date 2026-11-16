@@ -109,21 +109,41 @@ def reference_slices(model, inputs, budget=INT32_LIMIT):
     lead = inputs[0] if inputs and torch.is_tensor(inputs[0]) else None
     if lead is None or lead.dim() == 0 or lead.shape[0] <= 1 or lead.numel() <= 4096:
         return [slice(None)]
-    probe = [t[0:1] if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == lead.shape[0] else t
-             for t in inputs]
     probe_model = copy.deepcopy(model)
     was_training = probe_model.training
     probe_model.eval()
-    try:
+
+    def probe(rows):
+        sliced = [t[0:rows] if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == lead.shape[0] else t
+                  for t in inputs]
         with torch.no_grad():
-            probe_out = probe_model(*probe)
+            return probe_model(*sliced)
+
+    try:
+        probe_out = probe(1)
+        # A second probe tells an output that grows with inputs[0] rows apart from
+        # one whose row count is fixed by another input. moe_unpermute_mask
+        # returns row_id_map.shape[1] rows regardless of the activation rows, so
+        # the single-probe estimate (fixed-size output x 32768 leading rows)
+        # split the reference into 512 sinks and the concat collapsed to
+        # all-zero, failing every round as "reference-unsupported".
+        scales = True
+        if lead.shape[0] > 1:
+            try:
+                probe_out2 = probe(min(2, lead.shape[0]))
+                scales = (sum(t.shape[0] for t in tensors(probe_out2))
+                          != sum(t.shape[0] for t in tensors(probe_out)))
+            except Exception:
+                scales = True
     except Exception:
         return [slice(None)]
     finally:
         probe_model.train(was_training)
     per_sample = sum(t.numel() for t in tensors(probe_out))
-    total = per_sample * lead.shape[0]
-    if not per_sample or total <= budget:
+    if not per_sample:
+        return [slice(None)]
+    total = per_sample * lead.shape[0] if scales else per_sample
+    if total <= budget:
         return [slice(None)]
     return split_rows(lead, max(2, math.ceil(total / budget)))
 
@@ -381,20 +401,34 @@ def verify_cases(problem, kernel, device, direction="forward"):
                     expected = model(*inputs)
                 else:
                     expected = concat_outputs([model(*slice_inputs(inputs, sl)) for sl in slices])
-            # Reference sanity: an all-zero reference with non-zero inputs means the
-            # platform reference path is unsupported at this size (muDNN int32 limit),
-            # so no kernel can match it. Fail fast instead of spending refine rounds.
-            if expected.numel() and chunk_max(expected) == 0.0 and any(
-                    chunk_max(t) > 0.0 for t in tensors(inputs) if t.numel()):
+            # Reference sanity: an all-zero reference with non-zero inputs has two
+            # very different meanings.
+            #   (a) The graph is degenerate by construction: KernelBench L2 #80
+            #       reduces a (1024, 8192) GEMM over dim=1 to (1024, 1) and then
+            #       subtracts that row's own mean, which is exactly 0.0 in IEEE-754
+            #       for every row -- the true output IS all zero. It must be
+            #       compared like any other case: only status "passed" can satisfy
+            #       the suite, so skipping it fails every round unconditionally.
+            #   (b) The reference was evaluated at full shape beyond the int32
+            #       element index limit and silently returned zeros. That reference
+            #       is not authoritative, so no kernel can be judged against it.
+            expected_numel = sum(t.numel() for t in tensors(expected))
+            reference_all_zero = bool(expected_numel) and all(
+                chunk_max(t) == 0.0 for t in tensors(expected)) and any(
+                chunk_max(t) > 0.0 for t in tensors(inputs) if t.numel())
+            if reference_all_zero and len(slices) == 1 and expected_numel > INT32_LIMIT:
                 result["status"] = "reference-unsupported"
                 result["unsupported"] = True
                 result["error"] = (
-                    f"reference-unsupported-shape: reference output is all-zero at numel={expected.numel()} "
-                    "while the inputs are non-zero; the platform reference path is unsupported at this size "
-                    "(muDNN int32 element limit). This is not a kernel defect; do not rewrite the kernel.")
+                    f"reference-unsupported-shape: reference output is all-zero at numel={expected_numel}, "
+                    f"which exceeds the int32 element index limit (2**31-1={INT32_LIMIT}) while the inputs "
+                    "are non-zero; the full-shape eager reference overflows its int32 offsets and returns "
+                    "zeros at this size, so it is not authoritative. This is not a kernel defect; do not "
+                    "rewrite the kernel.")
                 result["contract"] = contract(model, inputs, expected, direction=direction)
                 results.append(result)
                 continue
+            result["reference_all_zero"] = reference_all_zero
             actual = bind_kernel_call(kernel, candidate_model, candidate_inputs)()
             # A collapsed (all-zero) candidate must never be excused by a loose
             # tolerance: atol=1e-2 would otherwise accept a kernel that returns
@@ -405,6 +439,11 @@ def verify_cases(problem, kernel, device, direction="forward"):
                     f"excused by the verification tolerance (policy: {case.get('tolerance_policy')})")
             tolerance = ({"rtol": case.get("rtol", 1e-4), "atol": case.get("atol", 1e-5)}
                          if "rtol" in case or "atol" in case else {})
+            if reference_all_zero:
+                # x - x.mean(dim=1) over a size-1 reduced dim is exact (a - a == 0.0),
+                # so a zero reference must be matched as zero: the benchmark's 1e-2
+                # tolerance would otherwise excuse a collapsed kernel.
+                tolerance = {"rtol": 0.0, "atol": min(float(tolerance.get("atol", 1e-5)), 1e-6)}
             assert_close_chunked(actual, expected, slices, tolerance)
             backward = None
             if direction in {"backward", "joint"}:

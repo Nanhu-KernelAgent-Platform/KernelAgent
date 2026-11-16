@@ -7,7 +7,7 @@ import torch
 
 from triton_kernel_agent.case_suite import (
     benchmark_cases, load_cases, measurement_is_covered, move, paired_cases, reference_contracts,
-    suite_test, verify_cases,
+    reference_slices, suite_test, verify_cases,
     run_guarded_test,
 )
 from triton_kernel_agent.experience import ExperienceRecord, OperatorSignature, SQLiteExperienceStore
@@ -332,3 +332,113 @@ def test_all_zero_candidate_is_never_excused_by_a_loose_tolerance(monkeypatch):
     rows = verify_cases(problem(TOLERANCE_SOURCE), zero_matmul, "cpu")
     assert rows[0]["status"] == "failed"
     assert "all-zero" in rows[0]["error"]
+
+
+# --- Multi-output references: a tuple/list reference is not a single tensor ---
+# The cp_seq_chunk_index_select case (KernelAgent case 6) returns
+# (index_select(k_ag, 0, index), index_select(v_ag, 0, index)); the reference
+# sanity probe used to call ``expected.numel()`` on that tuple and crashed with
+# "AttributeError: 'tuple' object has no attribute 'numel'" on every round.
+TUPLE_SOURCE = '''import torch
+class Model(torch.nn.Module):
+    def forward(self, k, v, index):
+        return (torch.index_select(k, 0, index), torch.index_select(v, 0, index))
+def get_inputs():
+    return [torch.randn(2, 3, 5).to(torch.bfloat16), torch.randn(2, 3, 4).to(torch.bfloat16),
+            torch.arange(2, dtype=torch.int32)]
+def get_init_inputs():
+    return []
+'''
+
+
+def tuple_reference(k, v, index):
+    return (torch.index_select(k, 0, index), torch.index_select(v, 0, index))
+
+
+def test_multi_output_reference_is_verified_without_tensor_only_assumptions():
+    rows = verify_cases(problem(TUPLE_SOURCE), tuple_reference, "cpu")
+    assert [row["status"] for row in rows] == ["passed"]
+    outputs = rows[0]["contract"]["outputs"]
+    assert [item["shape"] for item in outputs] == [[2, 3, 5], [2, 3, 4]]
+
+
+def test_multi_output_reference_wrong_candidate_fails_cleanly():
+    def zero_outputs(k, v, index):
+        return (torch.zeros_like(torch.index_select(k, 0, index)),
+                torch.zeros_like(torch.index_select(v, 0, index)))
+    rows = verify_cases(problem(TUPLE_SOURCE), zero_outputs, "cpu")
+    assert rows[0]["status"] == "failed"
+    assert "all-zero" in rows[0]["error"]
+
+
+def test_multi_output_all_zero_reference_is_compared_not_skipped():
+    zero_source = TUPLE_SOURCE.replace(
+        "return (torch.index_select(k, 0, index), torch.index_select(v, 0, index))",
+        "return (torch.zeros_like(k[0:index.numel()]), torch.zeros_like(v[0:index.numel()]))")
+    rows = verify_cases(problem(zero_source), tuple_reference, "cpu")
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["reference_all_zero"] is True
+
+
+# --- A degenerate graph is not an unsupported reference -----------------------
+# KernelBench L2 #80: max over dim=1 collapses (1024, 8192) to (1024, 1) and the
+# next step subtracts that row's own mean, which is exactly 0.0 for every row.
+# The all-zero reference is the TRUE output, but the reference-sanity probe used
+# to label it "reference-unsupported", and no status other than "passed" can
+# satisfy the suite -- so 5/5 refine rounds were wasted and the correct zero
+# kernel was never accepted.
+DEGENERATE_SOURCE = '''import torch
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(64, 32))
+        self.bias = torch.nn.Parameter(torch.randn(64))
+    def forward(self, x):
+        y = x @ self.weight.t() + self.bias
+        m = torch.max(y, dim=1, keepdim=True).values
+        return torch.nn.functional.gelu(m - m.mean(dim=1, keepdim=True))
+def get_inputs():
+    return [torch.rand(8, 32)]
+def get_init_inputs():
+    return []
+'''
+
+
+def test_degenerate_reference_is_verified_against_its_true_zero_output():
+    def zero_kernel(x):
+        return torch.zeros(x.shape[0], 1)
+    rows = verify_cases(problem(DEGENERATE_SOURCE), zero_kernel, "cpu")
+    assert [row["status"] for row in rows] == ["passed"]
+    assert rows[0]["reference_all_zero"] is True
+
+
+def test_degenerate_reference_still_rejects_a_non_zero_candidate():
+    def wrong_kernel(x):
+        return torch.ones(x.shape[0], 1)
+    rows = verify_cases(problem(DEGENERATE_SOURCE), wrong_kernel, "cpu")
+    assert rows[0]["status"] == "failed"
+
+
+# --- Reference chunking must not fire when output rows do not scale with inputs[0] ---
+# moe_unpermute_mask (KernelAgent case 15): out rows = row_id_map.shape[1], while
+# pin has 32768 activation rows. The single-probe estimate multiplied the fixed
+# 4096-row output by 32768 rows, split into 512 slices and the concat collapsed
+# to all-zero, failing every round as "reference-unsupported".
+NONSCALING_SOURCE = '''import torch
+class Model(torch.nn.Module):
+    def forward(self, x, w):
+        return torch.ones(w.shape[0], x.shape[1]) * x[0:1].mean(dim=0)
+def get_inputs():
+    return [torch.randn(2048, 8), torch.ones(3, dtype=torch.int64)]
+def get_init_inputs():
+    return []
+'''
+
+
+def test_fixed_row_output_is_not_split_by_leading_input_rows():
+    module = problem(NONSCALING_SOURCE)
+    x, w = (t.to("cpu") for t in module.get_inputs())
+    assert reference_slices(module.Model(), [x, w]) == [slice(None)]
+    rows = verify_cases(module, module.Model().forward, "cpu")
+    assert [row["status"] for row in rows] == ["passed"]
+    assert rows[0]["reference_chunked"] is False
