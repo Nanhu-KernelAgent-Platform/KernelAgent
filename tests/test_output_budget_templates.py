@@ -16,8 +16,8 @@
 
 The budget contract is prompt-layer only (no response-length validation code),
 so these tests pin the text the model actually receives: a token target, a
-"start at the FILE: header" anchor, a comment cap, dtype-on-demand, and the
-canonical setup.py shape.
+"start at the FILE: header" anchor, a comment cap, the dispatch/instantiation
+dtype-set contract (P74), and the canonical setup.py shape.
 """
 
 from triton_kernel_agent.kernel_backend import get_kernel_backend
@@ -58,7 +58,7 @@ def test_generation_prompt_carries_output_budget():
     # first-token anchor: no reasoning preamble before the blocks
     assert 'starts at the "F" of the first "FILE:" header' in prompt
     assert "5 comment lines" in prompt
-    assert "float64" in prompt
+    assert "dtype SET that binding.cpp" in prompt  # P74 dtype-set contract
     assert "MUSAExtension" in prompt  # canonical setup.py shape
 
 
