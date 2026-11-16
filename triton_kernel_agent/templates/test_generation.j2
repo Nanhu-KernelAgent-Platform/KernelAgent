@@ -87,17 +87,22 @@ DEBUGGING REQUIREMENTS:
   - Expected vs actual output values (or samples if large)
   - Input tensor shapes, dtypes, and sample values
   - Any intermediate results that can help identify the issue
-  - Use torch.allclose() with appropriate tolerances for floating point comparisons
+  - Use torch.testing.assert_close() for floating point comparisons
 - Include try/except blocks around numerical comparisons to catch and debug assertion errors
 
 NUMERICAL TOLERANCE REQUIREMENTS:
-- Use DEFAULT tolerances: rtol=1e-3, atol=1e-3 for torch.allclose()
-- Adjust tolerances ONLY if needed based on:
-  - Input data type (float16 and bfloat16 may need looser tolerances like rtol=1e-2, atol=2e-2)
-  - Input value ranges (very large or very small values may need adjusted tolerances)
-  - Specific algorithm characteristics (iterative algorithms may accumulate more error)
-  - If accumulation dimension is very large, use much larger tolerances, like 1e-1
-- Always document in comments why non-default tolerances are used
+- Compare with torch.testing.assert_close(); do NOT use torch.allclose() or
+  torch.testing.assert_allclose() as the final verdict, and do NOT pass rtol/atol.
+- NEVER hardcode rtol/atol in the test. The harness resolves the active standard
+  (KernelBench scores at atol=rtol=1e-2); a literal written here can silently
+  judge the kernel by a stricter standard than the run is scored with, which
+  rejects numerically sound kernels.
+- Obtain the tolerance from the harness and pass it through:
+  `from kernel_case_suite import verify_tolerance`
+  `torch.testing.assert_close(result, expected, **verify_tolerance())`
+- Do not widen the comparison yourself for bf16 or large accumulation
+  dimensions. If the result legitimately needs a looser standard, that is a
+  property of the problem definition, not something this test may decide.
 
 IMPORTANT: Do NOT use any Triton kernel launch syntax. Treat kernel_function as a regular Python function.
 
@@ -140,17 +145,14 @@ def test_kernel():
         # if isinstance(result, torch.Tensor) and result.device != input_tensor.device:
         #     return False
 
-        # Verify results with detailed debugging on failure
-        # Use default tolerances: rtol=1e-3, atol=1e-3
-        # Adjust only if needed based on dtype/range (bf16: rtol=1e-2, atol=2e-2)(document why)
-        #
-        # Examples of when to adjust tolerances:
-        # - For float16: rtol=1e-2, atol=1e-2  # Lower precision
-        # - For very large values (>1e6): rtol=1e-2, atol=1e-1  # Larger absolute errors expected
-        # - For iterative algorithms: rtol=1e-2, atol=1e-2  # Accumulation of errors
-        #
-        # if not torch.allclose(result, expected, rtol=1e-3, atol=1e-3):
-        #     print(f"NUMERICAL MISMATCH:")
+        # Verify results with detailed debugging on failure.
+        # Take the tolerance from the harness - never write rtol/atol here.
+        # import at the top: from kernel_case_suite import verify_tolerance
+        # try:
+        #     torch.testing.assert_close(result, expected, **verify_tolerance())
+        #     return True
+        # except AssertionError as mismatch:
+        #     print(f"NUMERICAL MISMATCH: {mismatch}")
         #     print(f"Input shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
         #     print(f"Expected shape: {expected.shape}, dtype: {expected.dtype}")
         #     print(f"Result shape: {result.shape}, dtype: {result.dtype}")

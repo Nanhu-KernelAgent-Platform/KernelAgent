@@ -106,15 +106,22 @@ Requirements:
   cases are allowed only after the shared factory workload passes.
 - Reproduce the exact forward semantics in the problem. Keep reference results
   local to the test.
-- Preserve explicit per-case tolerances. Only when none are supplied, use
-  rtol=1e-3 and atol=1e-3 for fp32, or at most rtol=1e-2 and atol=2e-2 for fp16/bf16.
+- Compare with `torch.testing.assert_close`. Take the tolerance from the harness
+  and never write rtol/atol into the test:
+  `from kernel_case_suite import verify_tolerance`
+  `torch.testing.assert_close(ref_out, native_out, **verify_tolerance())`
+  A literal written here can judge the kernel by a stricter standard than the
+  run is scored with (KernelBench scores at atol=rtol=1e-2), rejecting a
+  numerically sound kernel. Do not widen the comparison yourself for bf16 or a
+  large accumulation dimension.
 - Print PASS and exit with code 0 only after numerical equivalence succeeds.
 - On failure, print useful shape/dtype/error details and exit nonzero.
 - Do not pass a reference model or precomputed expected output to
   kernel_function.
 {% if forward_only %}
 - The reference comparison runs under `torch.no_grad()`; compare numeric
-  forward outputs (assert_close / allclose) and nothing else.
+  forward outputs (`torch.testing.assert_close` with `**verify_tolerance()`) and
+  nothing else.
 {% else %}
 - For training/backward, recompute reference outputs with torch.enable_grad().
   Never call backward/autograd.grad on a reference evaluated under no_grad or

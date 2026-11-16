@@ -169,6 +169,21 @@ def normalize_musa_imports(source: str) -> str:
     return source
 
 
+def ensure_case_suite_import(source: str) -> str:
+    """Guarantee ``kernel_case_suite`` is imported by every test file.
+
+    The module installs the benchmark tolerance pin on import, which forces the
+    comparison of a generated test onto the same standard as the explicit case
+    suite and the bridge evaluation. MUSA runs already import it through
+    ``run_guarded_test``; a directly launched test script needs the import so
+    that a test hardcoding its own rtol/atol cannot judge the kernel by a
+    different standard.
+    """
+    if "kernel_case_suite" in source:
+        return source
+    return "import kernel_case_suite  # install benchmark tolerance pin\n" + source
+
+
 # ---------------- Fix 6-1: output-cap truncation continuation ----------------
 #
 # The detector/continuation constants live in .llm_truncation so the agent seed
@@ -508,6 +523,7 @@ class VerificationWorker:
             path = self.workdir / name
             if is_musa:
                 code = normalize_musa_imports(code)
+            code = ensure_case_suite_import(code)
             path.write_text(code)
             self.test_files.append(path)
         from .case_suite import SUITE_MARKER
