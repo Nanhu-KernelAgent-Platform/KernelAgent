@@ -36,6 +36,15 @@ Generate a correct, efficient native MUSA kernel for the following problem.
   Values from `get_init_inputs()` (e.g. `dim`) are fixed at reference-model
   construction, so bake them into kernel.py (module constant or closure)
   instead of adding a required parameter.
+- Multi-module naming: when the reference Model has parameters in more than one
+  submodule (e.g. Linear + GroupNorm, Conv + BatchNorm => two `.weight`
+  leaves), the FIRST module may keep the bare `weight`/`bias` names, and every
+  OTHER module MUST be named `<module>_<param>` (e.g. `bn_weight`,
+  `group_norm_weight`, `bn_bias`). Do NOT use the `w`/`gamma`/`beta` aliases
+  in that case: a bare alias cannot name a module, so the binder rejects it
+  with "Cannot bind required kernel parameter(s)" before verification runs.
+  Single parameter-bearing models keep the canonical
+  `def kernel_function(x, weight, bias)` form.
 
 Return exactly four fenced FILE blocks and no prose: kernel.py, binding.cpp,
 kernel.mu, and setup.py.

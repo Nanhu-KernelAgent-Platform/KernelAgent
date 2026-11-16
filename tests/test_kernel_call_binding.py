@@ -44,11 +44,12 @@ def test_binds_nested_parameter_leaf_and_alias():
         def named_buffers(self):
             return iter(())
 
-    values, ordered = collect_model_values(Nested())
+    values, ordered, owners = collect_model_values(Nested())
     assert values["linear.weight"] is weight
     assert values["weight"] is weight
     assert values["w"] is weight
     assert ordered == [weight]
+    assert owners["weight"] == ["linear.weight"]
 
 
 def test_never_guesses_missing_kernel_arguments_from_constructor_inputs():
@@ -119,3 +120,143 @@ def test_numbered_submodule_alias_must_be_unambiguous():
 
     with pytest.raises(KernelCallBindingError, match="Ambiguous model state"):
         bind_kernel_call(kernel_function, Composite(), [object()])
+
+
+class TwoModuleModel(FakeModel):
+    """A fused reference: Linear + GroupNorm, i.e. two ``.weight`` leaves."""
+
+    def __init__(self):
+        self.gemm_weight = object()
+        self.gemm_bias = object()
+        self.gn_weight = object()
+        self.gn_bias = object()
+
+    def named_parameters(self):
+        return iter((
+            ("gemm.weight", self.gemm_weight), ("gemm.bias", self.gemm_bias),
+            ("group_norm.weight", self.gn_weight), ("group_norm.bias", self.gn_bias),
+        ))
+
+    def named_buffers(self):
+        return iter(())
+
+
+def test_ambiguous_alias_is_rejected_instead_of_binding_first_match():
+    """L2 #30: ``gamma`` must not silently bind the Linear weight (8192x8192)."""
+
+    def kernel_function(x, weight, bias, gamma, beta):
+        return x, weight, bias, gamma, beta
+
+    with pytest.raises(KernelCallBindingError) as excinfo:
+        bind_kernel_call(kernel_function, TwoModuleModel(), [object()])
+    message = str(excinfo.value)
+    assert "gamma" in message
+    assert "gemm.weight" in message and "group_norm.weight" in message
+    assert "group_norm_weight" in message
+
+
+def test_ambiguous_alias_does_not_fall_through_to_positional_input():
+    def kernel_function(x, extra, gamma):
+        return x, extra, gamma
+
+    with pytest.raises(KernelCallBindingError):
+        bind_kernel_call(kernel_function, TwoModuleModel(), [object(), object()])
+
+
+def test_qualified_names_bind_on_two_module_model():
+    model = TwoModuleModel()
+    x = object()
+
+    def kernel_function(x, gemm_weight, gemm_bias, group_norm_weight, group_norm_bias):
+        return x, gemm_weight, gemm_bias, group_norm_weight, group_norm_bias
+
+    assert bind_kernel_call(kernel_function, model, [x])() == (
+        x, model.gemm_weight, model.gemm_bias, model.gn_weight, model.gn_bias,
+    )
+
+
+def test_single_module_alias_still_binds():
+    """A lone ``weight``/``bias`` leaf keeps the alias behaviour (regression)."""
+    weight, bias = object(), object()
+
+    class Single(FakeModel):
+        def named_parameters(self):
+            return iter((("linear.weight", weight), ("linear.bias", bias)))
+
+        def named_buffers(self):
+            return iter(())
+
+    x = object()
+
+    def kernel_function(x, weight, bias, gamma, beta):
+        return x, weight, bias, gamma, beta
+
+    assert bind_kernel_call(kernel_function, Single(), [x])() == (
+        x, weight, bias, weight, bias,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Static seed gate + runtime probe (arbitration)
+# ---------------------------------------------------------------------------
+
+PROBLEM_TWO_MODULES = """
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self, in_features, out_features, num_groups):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+
+    def forward(self, x):
+        return self.group_norm(self.gemm(x))
+
+def get_inputs():
+    return [torch.rand(8, 16)]
+
+def get_init_inputs():
+    return [16, 32, 2]
+"""
+
+PROBLEM_BN = """
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(Model, self).__init__()
+        self.bn = nn.BatchNorm1d(out_features)
+
+    def forward(self, x):
+        return self.bn(x)
+
+def get_inputs():
+    return [torch.rand(8, 32)]
+
+def get_init_inputs():
+    return [32, 32]
+"""
+
+
+def test_static_gate_rejects_ambiguous_alias_signature():
+    from triton_kernel_agent.kernel_call_binding import kernel_signature_bindability
+
+    kernel = "def kernel_function(x, weight, bias, gamma, beta):\n    return x\n"
+    reason = kernel_signature_bindability(kernel, PROBLEM_TWO_MODULES)
+    assert reason is not None
+    assert "gamma" in reason and "beta" in reason
+    assert "group_norm_weight" in reason
+
+
+def test_static_gate_accepts_qualified_signature():
+    from triton_kernel_agent.kernel_call_binding import kernel_signature_bindability
+
+    kernel = (
+        "def kernel_function(x, gemm_weight, gemm_bias, "
+        "group_norm_weight, group_norm_bias):\n    return x\n"
+    )
+    assert kernel_signature_bindability(kernel, PROBLEM_TWO_MODULES) is None
+
+

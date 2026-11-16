@@ -29,17 +29,34 @@ def _set_leaf_alias(values: dict[str, Any], qualified_name: str, value: Any) -> 
     values.setdefault(qualified_name.rsplit(".", 1)[-1], value)
 
 
-def collect_model_values(model: Any | None) -> tuple[dict[str, Any], list[Any]]:
-    """Collect named parameters, buffers, and common module configuration."""
+def collect_model_values(
+    model: Any | None,
+) -> tuple[dict[str, Any], list[Any], dict[str, list[str]]]:
+    """Collect named parameters, buffers, and common module configuration.
+
+    The third value maps every leaf name (``weight``, ``bias``, ...) to the
+    qualified model-state keys that own it. Aliases such as ``gamma``/``beta``
+    resolve to a leaf without choosing a module, so callers can only accept
+    them when that leaf has a single owner; a fused model whose ``gemm`` and
+    ``group_norm`` both expose ``.weight`` makes the alias ambiguous instead of
+    silently binding the first match.
+    """
     if model is None:
-        return {}, []
+        return {}, [], {}
     values: dict[str, Any] = {}
     ordered_parameters: list[Any] = []
+    owners: dict[str, list[str]] = {}
+
+    def record(name: str) -> None:
+        owners.setdefault(name.rsplit(".", 1)[-1], []).append(name)
+
     for name, value in model.named_parameters():
         ordered_parameters.append(value)
         _set_leaf_alias(values, name, value)
+        record(name)
     for name, value in model.named_buffers():
         _set_leaf_alias(values, name, value)
+        record(name)
     for _, module in model.named_modules():
         for name in _MODULE_ATTRIBUTES:
             if hasattr(module, name):
@@ -47,7 +64,7 @@ def collect_model_values(model: Any | None) -> tuple[dict[str, Any], list[Any]]:
     for alias, canonical in _ALIASES.items():
         if canonical in values:
             values.setdefault(alias, values[canonical])
-    return values, ordered_parameters
+    return values, ordered_parameters, owners
 
 
 def _resolve_state_alias(name: str, values: dict[str, Any]) -> Any | None:
@@ -76,6 +93,44 @@ def _resolve_state_alias(name: str, values: dict[str, Any]) -> Any | None:
     return numbered[0] if numbered else None
 
 
+def _alias_conflict(
+    name: str,
+    values: dict[str, Any],
+    owners: dict[str, list[str]],
+) -> str | None:
+    """Return the rejection reason when a ``w``/``gamma``/``beta`` alias is ambiguous.
+
+    ``_ALIASES`` maps an alias onto the bare leaf (``weight``/``bias``); that is
+    the right answer only when exactly one parameter or buffer owns the leaf.
+    A fused model (Linear + GroupNorm, Conv + BatchNorm) exposes ``.weight``
+    twice, so the alias cannot name a module -- the failure mode that bound the
+    Linear's [out, in] weight as GroupNorm ``gamma`` and silently produced a
+    near-zero output (KernelBench L2 #30). Reject instead of picking the first
+    match, and name the module-qualified parameters the kernel should use.
+    """
+    if name not in _ALIASES:
+        return None
+    canonical = _ALIASES[name]
+    keys = owners.get(canonical) or []
+    if len(keys) <= 1:
+        return None
+    candidates = ", ".join(
+        f"{key} (shape {list(values[key].shape)})"
+        if hasattr(values.get(key), "shape")
+        else key
+        for key in keys
+    )
+    suggestions = ", ".join(key.replace(".", "_") for key in keys)
+    return (
+        f"Cannot bind required kernel parameter(s): {name}. The name is an "
+        f"alias of the model-state leaf '{canonical}', which the reference "
+        f"model exposes through multiple values: {candidates}. An alias cannot "
+        "choose a module, and it is not bound positionally or to the first "
+        f"match. Rename the parameter to a module-qualified name, e.g. "
+        f"{suggestions}."
+    )
+
+
 def bind_kernel_call(
     kernel_function: Callable[..., Any], model: Any | None, inputs: Sequence[Any]
 ) -> Callable[[], Any]:
@@ -83,10 +138,15 @@ def bind_kernel_call(
 
     ``get_init_inputs()`` is intentionally absent: those values construct the
     model and are never guessed to be kernel arguments.
+
+    Parameters are resolved by name against model state (qualified or leaf
+    aliases), then positionally from ``inputs``. A ``w``/``gamma``/``beta``
+    alias whose leaf belongs to more than one module is rejected with a
+    ``KernelCallBindingError`` rather than silently bound to the first match.
     """
     signature = inspect.signature(kernel_function)
     parameters = list(signature.parameters.values())
-    model_values, ordered_parameters = collect_model_values(model)
+    model_values, ordered_parameters, owners = collect_model_values(model)
     if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
         positional = [*inputs, *ordered_parameters]
         return lambda: kernel_function(*positional)
@@ -97,6 +157,9 @@ def bind_kernel_call(
     for parameter in parameters:
         if parameter.kind is inspect.Parameter.VAR_KEYWORD:
             continue
+        conflict = _alias_conflict(parameter.name, model_values, owners)
+        if conflict is not None:
+            raise KernelCallBindingError(conflict)
         source_name = _ALIASES.get(parameter.name, parameter.name)
         if source_name in model_values:
             value = model_values[source_name]
@@ -208,12 +271,19 @@ def _get_inputs_arity(problem_tree: ast.Module) -> int | None:
     return None
 
 
-def _bindable_names(problem_tree: ast.Module) -> set[str] | None:
+def _bindable_names(
+    problem_tree: ast.Module,
+) -> tuple[set[str], dict[str, list[str]]] | None:
     """Superset of the names ``collect_model_values`` can expose for this Model.
 
     Over-approximating is deliberate: a name that is claimed bindable here but
     is not at runtime can only hide a genuine mismatch (a missed catch), while
     under-approximating would reject a kernel the runtime accepts.
+
+    Returns ``(bindable_names, ambiguous_leaves)``: the second value maps a
+    leaf (``weight``/``bias``) to every module that statically contributes one,
+    so the seed gate can reject a ``gamma``/``beta``/``w`` alias the same way
+    the runtime binder does. ``None`` when the Model cannot be read statically.
     """
     model = _top_level(problem_tree, "Model")
     if not isinstance(model, ast.ClassDef):
@@ -233,6 +303,18 @@ def _bindable_names(problem_tree: ast.Module) -> set[str] | None:
     # recognized without treating plain configuration (``self.dim = dim``) as
     # bindable state.
     local_modules: set[str] = set()
+    # Leaf -> qualified parameter names contributed by each module. Two modules
+    # make a bare ``weight``/``bias`` leaf ambiguous, which is what the runtime
+    # alias rejection and the seed gate both key on.
+    param_owners: dict[str, list[str]] = {}
+
+    def record_owner(attr: str) -> None:
+        for leaf, suffix in (("weight", "_weight"), ("bias", "_bias")):
+            keys = param_owners.setdefault(leaf, [])
+            key = f"{attr}{suffix}"
+            if key not in keys:
+                keys.append(key)
+
     for stmt in init.body:
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
@@ -275,6 +357,7 @@ def _bindable_names(problem_tree: ast.Module) -> set[str] | None:
                 names.add(target.attr)
                 names.add(f"{target.attr}_weight")
                 names.add(f"{target.attr}_bias")
+                record_owner(target.attr)
                 continue
             path = _dotted(value.func, aliases)
             leaf = path.rsplit(".", 1)[-1]
@@ -285,6 +368,7 @@ def _bindable_names(problem_tree: ast.Module) -> set[str] | None:
                 has_module = True
                 names.add(f"{target.attr}_weight")
                 names.add(f"{target.attr}_bias")
+                record_owner(target.attr)
         elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             call = stmt.value
             leaf = _dotted(call.func, aliases).rsplit(".", 1)[-1]
@@ -295,7 +379,10 @@ def _bindable_names(problem_tree: ast.Module) -> set[str] | None:
                 names.add(call.args[0].value)
     if has_module:
         names |= set(_MODULE_ATTRIBUTES)
-    return names
+    ambiguous = {
+        leaf: owners for leaf, owners in param_owners.items() if len(owners) > 1
+    }
+    return names, ambiguous
 
 
 def _dotted(node: ast.AST, aliases: dict[str, str]) -> str:
@@ -338,13 +425,41 @@ def kernel_signature_bindability(kernel_source: str, problem_source: str) -> str
     defaulted = set()
     if arguments.defaults:
         defaulted = set(range(len(positional) - len(arguments.defaults), len(positional)))
-    bindable = _bindable_names(problem_tree)
+    bindable_names = _bindable_names(problem_tree)
     arity = _get_inputs_arity(problem_tree)
-    if bindable is None or arity is None:
+    if bindable_names is None or arity is None:
         return None
+    bindable, ambiguous = bindable_names
 
     def resolves(name: str) -> bool:
         return _ALIASES.get(name, name) in bindable
+
+    # Alias parameters (``w``/``gamma``/``beta``) resolve through the bare leaf,
+    # which only names one module when that leaf has a single owner. The runtime
+    # binder rejects an ambiguous alias before running anything; reject the
+    # seed here so the repair round rewrites the signature instead of spending
+    # a full verification round on a kernel that cannot bind.
+    declared_aliases = [parameter.arg for parameter in positional] + [
+        parameter.arg for parameter in arguments.kwonlyargs
+    ]
+    conflicting = [
+        name for name in declared_aliases
+        if name in _ALIASES and _ALIASES[name] in ambiguous
+    ]
+    if conflicting:
+        leaf = _ALIASES[conflicting[0]]
+        candidates = ", ".join(ambiguous[leaf])
+        suggestions = ", ".join(ambiguous[leaf])
+        return (
+            "kernel_function declares alias parameter(s) "
+            f"{', '.join(conflicting)} that are ambiguous for this Model: the "
+            f"reference Model assigns a '{leaf}' to multiple submodules "
+            f"({candidates}), so a bare alias cannot name one of them and the "
+            "runtime binder rejects it instead of binding the first match. "
+            "Rename the parameter to a module-qualified name such as "
+            f"{suggestions}; keep the bare 'weight'/'bias' only for the primary "
+            "module."
+        )
 
     slots = arity
     missing: list[str] = []

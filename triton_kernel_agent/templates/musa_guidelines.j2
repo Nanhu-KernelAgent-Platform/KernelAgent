@@ -14,6 +14,12 @@ Generate a native MUSA extension bundle.
   "Cannot bind required kernel parameter(s): bias" before any kernel runs.
   If you need a bias slot at all, give it a default (bias=None); never make it
   required when the model has none.
+- MULTI-MODULE NAMES: a two-module model (Linear+GroupNorm, Conv+BatchNorm, ...)
+  gives the bare leaf `weight` multiple owners. Keep bare `weight`/`bias` only
+  for the FIRST module and name every other module `<module>_<param>`
+  (`bn_weight`, `group_norm_weight`, `bn_bias`, ...). The `w`/`gamma`/`beta`
+  aliases are ambiguous there and are rejected with
+  "Cannot bind required kernel parameter(s)" before verification.
 - HYPER-PARAMETER TYPES: PyTorch normalizes conv-style scalars when the
   reference module is constructed, so the BOUND values are tuples:
   kernel_size=(5,), stride=(1,), padding=(0,), dilation=(3,),
