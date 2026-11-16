@@ -260,3 +260,27 @@ def test_static_gate_accepts_qualified_signature():
     assert kernel_signature_bindability(kernel, PROBLEM_TWO_MODULES) is None
 
 
+def test_runtime_probe_confirms_ambiguous_alias_rejection():
+    from triton_kernel_agent.kernel_call_binding import runtime_bindability_probe
+
+    kernel = "def kernel_function(x, weight, bias, gamma, beta):\n    return x\n"
+    reason = runtime_bindability_probe(kernel, PROBLEM_TWO_MODULES, static_reason="x")
+    assert reason is not None
+    assert "gamma" in reason
+    assert "group_norm_weight" in reason
+
+
+def test_runtime_probe_overrules_static_false_negative():
+    """Static names miss implicit BatchNorm buffers; the probe accepts the seed."""
+    from triton_kernel_agent.kernel_call_binding import (
+        kernel_signature_bindability,
+        runtime_bindability_probe,
+    )
+
+    kernel = (
+        "def kernel_function(x, weight, bias, running_mean, running_var):\n"
+        "    return x\n"
+    )
+    static_reason = kernel_signature_bindability(kernel, PROBLEM_BN)
+    assert static_reason is not None
+    assert runtime_bindability_probe(kernel, PROBLEM_BN, static_reason=static_reason) is None

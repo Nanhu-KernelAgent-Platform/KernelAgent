@@ -53,7 +53,10 @@ from triton_kernel_agent.kernel_backend import (
     get_kernel_backend,
     validate_musa_bundle_semantics,
 )
-from triton_kernel_agent.kernel_call_binding import kernel_signature_bindability
+from triton_kernel_agent.kernel_call_binding import (
+    kernel_signature_bindability,
+    runtime_bindability_probe,
+)
 from triton_kernel_agent.experience import (
     ExperienceRecord,
     SQLiteExperienceStore,
@@ -878,7 +881,27 @@ def kernel_function(*args, **kwargs):
                 # (25-30 min) later (P57 round 6: stride_h/padding_w/batch_size
                 # on top of the single tensor input). Reject the seed here and
                 # let the existing complete-format repair feed the reason back.
+                #
+                # The static name set under-approximates runtime state for
+                # buffers that module constructors create implicitly
+                # (BatchNorm*d running statistics, register_buffer inside
+                # custom modules, ...), which made correct signatures
+                # unpassable (P77, 2026-11-14). A statically rejected seed is
+                # therefore arbitrated by a probe that replays the real
+                # bind_kernel_call fill decision (including the ambiguous
+                # w/gamma/beta alias rejection) on a meta-device Model; only a
+                # genuinely unbindable signature is still rejected.
                 reason = kernel_signature_bindability(wrapper, problem_description)
+                if reason:
+                    reason = runtime_bindability_probe(
+                        wrapper, problem_description, static_reason=reason
+                    )
+                    if reason is None:
+                        self.logger.info(
+                            "Runtime bindability probe overruled the static "
+                            "rejection (static names under-approximate model "
+                            "buffers); accepting the seed"
+                        )
                 if reason:
                     raise ValueError(reason)
             return bundle

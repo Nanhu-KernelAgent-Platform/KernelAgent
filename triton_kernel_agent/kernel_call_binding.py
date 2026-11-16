@@ -488,3 +488,169 @@ def kernel_signature_bindability(kernel_source: str, problem_source: str) -> str
         "per-dimension sizes, and derived output shapes into kernel.py as module "
         "constants or closures instead of declaring them as parameters."
     )
+
+
+# ---------------------------------------------------------------------------
+# Runtime bindability probe (arbitration for a statically rejected seed)
+# ---------------------------------------------------------------------------
+# ``kernel_signature_bindability`` builds its bindable-name set from Model
+# source alone, so it under-approximates the runtime state for buffers a
+# module constructor creates implicitly (``BatchNorm*d`` running statistics,
+# ``register_buffer`` calls executed inside custom modules, ...). Rejecting
+# such a signature at seed-extraction time kills every repair round: the
+# runtime ``bind_kernel_call`` can fill the parameter, but the static gate
+# refuses the seed (P77, 2026-11-14: ``running_mean`` / ``running_var`` are
+# named buffers, so a correct BatchNorm3d-inference kernel could never pass).
+# The probe below replays *exactly* the fill decision of ``bind_kernel_call``
+# against a meta-device ``Model`` instance and is called only after the static
+# check already rejected the seed. It also replays the alias-ambiguity
+# rejection, so a genuinely ambiguous ``gamma``/``beta``/``w`` seed stays
+# rejected while a signature the runtime can fill is accepted.
+try:  # pragma: no cover - torch is a hard runtime dependency in production
+    import torch
+except Exception:  # pragma: no cover - keeps pure-AST helpers importable
+    torch = None
+
+
+def _extract_signature_slots(
+    kernel_source: str,
+) -> tuple[list[str], set[str], bool] | None:
+    """Return (parameter names, defaulted names, has_vararg) of kernel_function.
+
+    Names are ordered like ``inspect.signature`` (positional-only, positional-
+    or-keyword, then keyword-only) so positional-slot consumption mirrors
+    ``bind_kernel_call`` exactly. Returns None when the wrapper cannot be
+    parsed unambiguously.
+    """
+    tree = _parse_text(kernel_source)
+    if tree is None:
+        return None
+    signature = _top_level(tree, "kernel_function")
+    if not isinstance(signature, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    arguments = signature.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    names = [parameter.arg for parameter in positional]
+    defaulted: set[str] = set()
+    if arguments.defaults:
+        defaulted.update(
+            parameter.arg
+            for parameter in positional[len(positional) - len(arguments.defaults):]
+        )
+    for parameter, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
+        names.append(parameter.arg)
+        if default is not None:
+            defaulted.add(parameter.arg)
+    return names, defaulted, arguments.vararg is not None
+
+
+def _instantiate_problem(problem_source: str) -> tuple[Any, list[Any]] | None:
+    """Build ``Model(*get_init_inputs())`` and ``get_inputs()`` on meta.
+
+    The probe only needs the bindable names and the positional arity, so the
+    whole instantiation runs under ``torch.device("meta")``: no tensor storage
+    is allocated (a Level-2 problem's get_inputs() can otherwise allocate
+    hundreds of MB) while named parameters and buffers are still real. Any
+    failure returns None so the caller abstains instead of rejecting a seed on
+    a probe malfunction.
+    """
+    if torch is None:
+        return None
+    try:
+        namespace: dict[str, Any] = {}
+        with torch.device("meta"):
+            exec(compile(problem_source, "<problem>", "exec"), namespace)
+            model_class = namespace.get("Model")
+            if not callable(model_class):
+                return None
+            init_args = (
+                list(namespace["get_init_inputs"]())
+                if callable(namespace.get("get_init_inputs"))
+                else []
+            )
+            model = model_class(*init_args)
+            if callable(namespace.get("get_inputs")):
+                inputs = list(namespace["get_inputs"]())
+            else:
+                tree = _parse_text(problem_source)
+                arity = _get_inputs_arity(tree) if tree is not None else None
+                if arity is None:
+                    return None
+                inputs = [None] * arity
+        return model, inputs
+    except Exception:
+        return None
+
+
+def runtime_bindability_probe(
+    kernel_source: str,
+    problem_source: str,
+    static_reason: str = "",
+) -> str | None:
+    """Arbitrate a statically rejected seed against the *real* binding rules.
+
+    Called only after ``kernel_signature_bindability`` returned a reason.
+    Replays the fill decision of ``bind_kernel_call`` (alias-ambiguity check,
+    name, then state alias, then a positional input slot, then a default)
+    against a meta-device model:
+
+    * ``None`` -- the runtime can fill every parameter, so the static
+      rejection was a false negative (implicit module buffers) and the seed
+      must be accepted;
+    * a rejection reason -- the runtime cannot fill some parameter either (a
+      genuine defect, including an ambiguous ``w``/``gamma``/``beta`` alias),
+      reported together with the available model value names so the repair
+      round can converge in one attempt;
+    * ``None`` on probe failure (unparseable input, exec/instantiation error,
+      missing torch, ambiguous state) -- abstain rather than kill a seed on a
+      probe malfunction.
+    """
+    slots = _extract_signature_slots(kernel_source)
+    if slots is None:
+        return None
+    parameter_names, defaulted, has_vararg = slots
+    built = _instantiate_problem(problem_source)
+    if built is None:
+        return None
+    model, inputs = built
+    model_values, _ordered_parameters, owners = collect_model_values(model)
+    if has_vararg:
+        # bind_kernel_call feeds every input and named parameter positionally
+        # when the signature declares *args; it cannot run out of slots.
+        return None
+    missing: list[str] = []
+    input_index = 0
+    for name in parameter_names:
+        # The runtime binder rejects an ambiguous w/gamma/beta alias outright;
+        # replay that decision so a genuinely ambiguous seed stays rejected.
+        conflict = _alias_conflict(name, model_values, owners)
+        if conflict is not None:
+            return conflict
+        source_name = _ALIASES.get(name, name)
+        if source_name in model_values:
+            continue
+        try:
+            if _resolve_state_alias(source_name, model_values) is not None:
+                continue
+        except KernelCallBindingError:
+            # Ambiguous state is a runtime error the verification phase reports
+            # with its own specific message; do not double-report it here.
+            return None
+        if input_index < len(inputs):
+            input_index += 1
+            continue
+        if name in defaulted:
+            continue
+        missing.append(name)
+    if not missing:
+        return None
+    available = ", ".join(sorted(model_values)) or "none"
+    detail = f" (static check said: {static_reason})" if static_reason else ""
+    return (
+        "runtime binding probe also cannot supply parameter(s): "
+        f"{', '.join(missing)}; available model values: {available}{detail}. "
+        "Every consumer binds parameters by name from model state (named "
+        "parameters/buffers, w/gamma/beta aliases, and module configuration) "
+        "and positionally from the get_inputs() values; anything else must "
+        "have a default."
+    )
