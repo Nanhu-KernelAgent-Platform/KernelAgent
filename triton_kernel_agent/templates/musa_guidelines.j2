@@ -16,9 +16,13 @@ Generate a native MUSA extension bundle.
   required when the model has none.
 - MULTI-MODULE NAMES: a two-module model (Linear+GroupNorm, Conv+BatchNorm, ...)
   gives the bare leaf `weight` multiple owners. Keep bare `weight`/`bias` only
-  for the FIRST module and name every other module `<module>_<param>`
-  (`bn_weight`, `group_norm_weight`, `bn_bias`, ...). The `w`/`gamma`/`beta`
-  aliases are ambiguous there and are rejected with
+  for the FIRST module; name every other module's parameters AND buffers by
+  its FULL module attribute path with dots replaced by underscores:
+  `batch_norm_weight`, `batch_norm_bias`, `batch_norm_running_mean`,
+  `batch_norm_running_var`. Abbreviations do NOT bind (`bn_weight` is
+  rejected; only `batch_norm_weight` resolves). Implicit buffers may also use
+  their bare leaf names (`running_mean`, `running_var`, `num_batches_tracked`).
+  The `w`/`gamma`/`beta` aliases are ambiguous there and are rejected with
   "Cannot bind required kernel parameter(s)" before verification.
 - HYPER-PARAMETER TYPES: PyTorch normalizes conv-style scalars when the
   reference module is constructed, so the BOUND values are tuples:

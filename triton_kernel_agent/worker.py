@@ -251,6 +251,48 @@ _FORMAT_NUDGE = (
     "Preserve the public contract and do not weaken any test."
 )
 
+# Refine-time binding audit probe (fix 2, KernelBench L2 #26). Runs fully on
+# CPU inside the workdir: extracts kernel_function's signature from kernel.py
+# by AST (the def is exec'd but its body is never executed, so the audit works
+# even when the extension did not build), builds the reference Model from the
+# problem description the same way the case suite does (real source file +
+# sys.modules registration, so getsource -- and therefore the decoy guard of
+# fix 1 -- sees the same usage evidence as the authoritative gate), and prints
+# what bind_kernel_call delivers per parameter.
+BINDING_AUDIT_PROBE = r'''
+import ast, re, sys, types
+import torch
+from kernel_call_binding import binding_audit
+
+problem_description = sys.stdin.read()
+headings = list(re.finditer(r"(?m)^## Describe2[^\n]*\n", problem_description))
+source = problem_description[headings[-1].end():] if headings else problem_description
+# Mirror the case-suite companion: a real file plus a sys.modules entry makes
+# inspect.getsource work on the exec'd Model, so the decoy guard (fix 1) and
+# the audit agree with the binding the verification gate actually performed.
+open("case_reference.py", "w", encoding="utf-8").write(source)
+problem = types.ModuleType("case_reference")
+problem.__file__ = "case_reference.py"
+sys.modules["case_reference"] = problem
+exec(compile(source, "case_reference.py", "exec"), problem.__dict__)
+get_init_inputs = getattr(problem, "get_init_inputs", lambda: [])
+model = problem.Model(*get_init_inputs())
+inputs = list(problem.get_inputs()) if callable(getattr(problem, "get_inputs", None)) else []
+
+kernel_source = open("kernel.py", encoding="utf-8").read()
+tree = ast.parse(kernel_source)
+func = next((node for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name == "kernel_function"), None)
+if func is None:
+    sys.exit(0)
+scope = {"__builtins__": __builtins__}
+exec(compile(ast.Module(body=[func], type_ignores=[]), "<audit_kernel>", "exec"), scope)
+print("BINDING_AUDIT_BEGIN")
+print(binding_audit(scope["kernel_function"], model, inputs))
+print("BINDING_AUDIT_END")
+'''
+
 
 def _classify_malformed(reason: str) -> str:
     """Return 'content' | 'format' | 'semantic' for a malformed-reason string."""
@@ -589,6 +631,45 @@ class VerificationWorker:
         generated test comparing against a full-shape reference cannot be authoritative.
         """
         return any(row.get("reference_chunked") for row in self.last_case_results)
+
+    @staticmethod
+    def _binding_audit_wanted(stdout: str, stderr: str, case_results: list) -> bool:
+        """Numeric/bind failures only: the audit is noise after build errors.
+
+        Explicit-case rows exist exactly when the kernel ran and produced
+        numbers; a bind failure surfaces either as a failed row or as the
+        binder's own message. Ninja/mcc build failures match neither.
+        """
+        if any(row.get("status") != "passed" for row in case_results or []):
+            return True
+        return "Cannot bind required kernel parameter" in (stdout + stderr)
+
+    def _binding_audit_report(self, problem_description: str) -> str:
+        """Run the CPU binding-audit probe in the workdir; '' when unavailable.
+
+        Bounded and best-effort: a probe crash, timeout, or missing markers
+        yields an empty report, and the refinement round proceeds exactly as
+        before -- the audit augments feedback, it is never a gate.
+        """
+        probe = self.workdir / "binding_audit_probe.py"
+        try:
+            probe.write_text(BINDING_AUDIT_PROBE, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(probe)],
+                cwd=str(self.workdir),
+                input=problem_description,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        out = result.stdout or ""
+        if "BINDING_AUDIT_BEGIN" not in out or "BINDING_AUDIT_END" not in out:
+            return ""
+        report = out.split("BINDING_AUDIT_BEGIN", 1)[1]
+        report = report.split("BINDING_AUDIT_END", 1)[0].strip()
+        return report[:2000]
 
     def _run_test(self) -> tuple[bool, str, str]:
         """
@@ -1035,6 +1116,21 @@ class VerificationWorker:
                     "stderr": _clip_error_text(stderr),
                     "history": list(self.history),
                 }
+                # Fix 2 (binding audit): numeric mismatches carry no cause --
+                # a decoy-parameter binding (L2 #26 trap A) and a rewritten
+                # activation formula (trap B) produce the same aggregate
+                # statistics, so the refinement model alternated between them
+                # for five rounds. Name the tensor every parameter actually
+                # received, and the two failure classes separate.
+                if self._binding_audit_wanted(
+                    stdout, stderr, getattr(self, "last_case_results", [])
+                ):
+                    audit = self._binding_audit_report(problem_description)
+                    if audit:
+                        error_info["stderr"] = (
+                            f"{error_info['stderr']}\n\n{audit}"
+                            if error_info["stderr"] else audit
+                        )
             else:
                 # Fix P1 (B): malformed recovery round. The previous kernel was
                 # not regenerated successfully, so skip verification and

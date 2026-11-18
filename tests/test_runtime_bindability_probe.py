@@ -14,6 +14,12 @@ decision of ``bind_kernel_call`` against a meta-device ``Model``. These tests
 pin the probe to the real binder (golden parity) across signature styles and
 problem shapes instead of pinning it to one problem's spelling, so any future
 divergence between the two binding paths fails a test.
+
+The 2026-11-17 L2 #15/#72 fix extends ``_resolve_state_alias`` with a
+full-path underscore match, so module-qualified multi-word leaves
+(``batch_norm_running_mean`` -> ``batch_norm.running_mean``) bind exactly
+like ``batch_norm_weight`` always did; the parity table below pins that
+behaviour as well.
 """
 import pytest
 import torch
@@ -207,11 +213,13 @@ CASES = [
         "x, conv_weight, conv_bias, bn_weight, bn_bias, bn_running_mean, bn_running_var",
         False,
     ),
+    # -- L2 #15/#72 fix: full-path underscore resolution makes the
+    #    module-qualified buffer spelling bindable (probe == binder == True).
     (
         "bn3d_module_prefixed_running_stats",
         BN3D_PROBLEM,
         "x, batch_norm_weight, batch_norm_bias, batch_norm_running_mean, batch_norm_running_var",
-        False,
+        True,
     ),
     # -- generality across batch-norm dimensions ---------------------------
     ("bn2d_running_stats", BN2D_PROBLEM, "x, weight, bias, running_mean, running_var", True),
@@ -271,14 +279,31 @@ def test_p77_static_gate_rejected_valid_signature_but_probe_accepts():
     assert runtime_ok
 
 
+def test_probe_accepts_module_qualified_running_stats():
+    """L2 #15/#72: the historically fatal module-qualified spelling now binds."""
+    kernel_source = _kernel(
+        "x, batch_norm_weight, batch_norm_bias, "
+        "batch_norm_running_mean, batch_norm_running_var"
+    )
+    static_reason = kernel_signature_bindability(kernel_source, BN3D_PROBLEM)
+    assert static_reason is not None  # static names still cannot see the buffers
+    assert runtime_bindability_probe(
+        kernel_source, BN3D_PROBLEM, static_reason=static_reason
+    ) is None
+
+
 def test_probe_rejection_names_missing_parameters_and_available_state():
-    kernel_source = _kernel("x, batch_norm_running_mean, batch_norm_running_var")
+    kernel_source = _kernel("x, bn_running_mean, bogus_stat")
     reason = runtime_bindability_probe(kernel_source, BN3D_PROBLEM)
     assert reason is not None
-    assert "batch_norm_running_mean" in reason
-    assert "batch_norm_running_var" in reason
-    # The available-state list lets the repair round converge in one attempt.
+    assert "bn_running_mean" in reason
+    assert "bogus_stat" in reason
+    # The available-state list must be signature-ready: dotted keys come with
+    # their usable parameter spellings so the repair round can converge in
+    # one attempt (L2 #15/#72: bare dotted names were uncopyable).
     assert "batch_norm.running_mean" in reason
+    assert "write as batch_norm_running_mean" in reason
+    assert "write as batch_norm_running_var" in reason
     assert "running_mean" in reason
 
 

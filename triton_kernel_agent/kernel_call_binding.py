@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import textwrap
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -68,7 +69,37 @@ def collect_model_values(
 
 
 def _resolve_state_alias(name: str, values: dict[str, Any]) -> Any | None:
-    """Match generated ``module_weight`` names to qualified model state."""
+    """Match generated ``module_leaf`` names to qualified model state.
+
+    Two resolution passes, most specific first:
+
+    1. Full-path underscore match: every qualified model-state key
+       ``<module path>.<leaf>`` is addressable as the parameter name
+       obtained by replacing its dots with underscores, so
+       ``batch_norm_running_mean`` resolves ``batch_norm.running_mean``
+       exactly like ``batch_norm_weight`` resolves ``batch_norm.weight``.
+       The historical last-underscore split cannot express multi-word
+       leaves (``running_mean``), which made every module-qualified
+       spelling of an implicit BatchNorm buffer unbindable while the
+       repair guidance kept recommending exactly that spelling
+       (KernelBench L2 #15/#72: all repair rounds rejected).
+    2. Legacy fallback, unchanged: single-word ``weight``/``bias``
+       leaves split at the last underscore, then the numbered-module
+       form (``fc_weight`` -> ``fc1.weight``).
+    """
+    full = [
+        value
+        for key, value in values.items()
+        if "." in key and key.replace(".", "_") == name
+    ]
+    if len(full) == 1:
+        return full[0]
+    if len(full) > 1:
+        # Two distinct dotted keys underscore-join to the same name only
+        # when module/leaf names contain mimicking underscores
+        # (``batch_norm.running_mean`` vs ``batch.norm_running_mean``).
+        # Refuse rather than pick one.
+        raise KernelCallBindingError(f"Ambiguous model state for {name}")
     stem, separator, leaf = name.rpartition("_")
     if not separator or leaf not in {"weight", "bias"}:
         return None
@@ -127,7 +158,138 @@ def _alias_conflict(
         f"model exposes through multiple values: {candidates}. An alias cannot "
         "choose a module, and it is not bound positionally or to the first "
         f"match. Rename the parameter to a module-qualified name, e.g. "
-        f"{suggestions}."
+        f"{suggestions}. Implicitly-created buffers (e.g. BatchNorm running "
+        "statistics) are not affected by this ambiguity: bind them by bare "
+        "leaf name (running_mean, running_var) or module-qualified name "
+        "(batch_norm_running_mean)."
+    )
+
+
+def _collect_self_attrs(func: ast.AST) -> set[str]:
+    """``self.<attr>`` names referenced inside one method body."""
+    used: set[str] = set()
+    for node in ast.walk(func):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "self"):
+            used.add(node.attr)
+    return used
+
+
+def _class_used_attrs(source: str) -> set[str] | None:
+    """``self.<attr>`` names a Model class references outside ``__init__``.
+
+    ``__init__`` assignments register state, they do not use it: counting
+    them would mark every parameter "used" and defeat decoy detection.
+    ``None`` (unparseable source) is distinct from ``set()``: callers keep
+    the legacy binding when evidence is missing instead of guessing.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+    used: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for func in node.body:
+                if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and func.name != "__init__":
+                    used |= _collect_self_attrs(func)
+    return used
+
+
+def _model_used_attrs(model: Any) -> set[str] | None:
+    """``_class_used_attrs`` from a live model instance's class source."""
+    try:
+        source = inspect.getsource(type(model))
+    except (OSError, TypeError):
+        return None
+    return _class_used_attrs(source)
+
+
+def _source_used_attrs(problem_source: str) -> set[str] | None:
+    """``_class_used_attrs`` from raw problem text (static/probe paths).
+
+    The runtime binder reads the same set via ``inspect.getsource``; this
+    twin serves paths that only hold the problem text, whose Model instances
+    are exec'd from strings where ``getsource`` fails.
+    """
+    return _class_used_attrs(problem_source)
+
+
+def _resolve_bare_leaf(
+    name: str,
+    values: dict[str, Any],
+    owners: dict[str, list[str]],
+    used_attrs: set[str] | None,
+) -> tuple[Any | None, str | None]:
+    """Disambiguate a bare leaf name that is also a full model-state path.
+
+    ``collect_model_values`` stores a submodule parameter under both its
+    qualified path (``conv_transpose.bias``) and, via ``setdefault``, a bare
+    leaf alias (``bias``). A top-level parameter whose full path IS the leaf
+    name overwrites that alias, so ``kernel_function(..., bias, ...)`` bound
+    the decoy ``self.bias`` [64,1,1,1,1] instead of ``conv_transpose.bias``
+    [64] (KernelBench L2 #26: the decoy never appears in forward(); every
+    round failed with 95.6% mismatch and max|diff| ~10.4, an error signature
+    no aggregate statistic could localize).
+
+    Only the dangerous overlap changes behaviour -- a bare leaf owned by
+    several submodules keeps its documented first-module-wins contract:
+
+    1. The exact full-path owner referenced by the class (``self.bias``)
+       wins: the parameter names that state exactly (L2 #75 declares
+       ``bias`` beside ``gemm``/``groupnorm`` and must keep binding the
+       top-level parameter its forward adds).
+    2. Otherwise the exact owner is dead state; keep only owners whose
+       top-level module the class references. Exactly one survivor resolves
+       to it (#26 -> ``conv_transpose.bias``).
+    3. Zero or several survivors reject with the module-qualified
+       spellings; missing evidence (``used_attrs is None``) keeps the legacy
+       binding -- never regress a working kernel when disambiguation
+       evidence is absent (the refine binding audit exposes a wrong tensor
+       instead).
+
+    Returns ``(value, None)`` when resolved, ``(None, reason)`` to reject,
+    ``(None, None)`` when the guard does not apply.
+    """
+    keys = owners.get(name) or []
+    if len(keys) <= 1:
+        return None, None
+    exact = [key for key in keys if key == name]
+    others = [key for key in keys if key != name]
+    if not exact or not others:
+        # Pure multi-submodule leaf: the first module keeps the bare name
+        # (documented contract); nothing was hijacked.
+        return None, None
+    if used_attrs is None:
+        return None, None
+    if name in used_attrs:
+        # (1) forward() references this exact state directly.
+        return values[name], None
+    live = [key for key in others if key.split(".", 1)[0] in used_attrs]
+
+    def described(key: str) -> str:
+        value = values.get(key)
+        if hasattr(value, "shape"):
+            return f"{key} (shape {list(value.shape)})"
+        return key
+
+    candidates = ", ".join(described(key) for key in keys)
+    suggestions = ", ".join(key.replace(".", "_") for key in (*others, name))
+    if len(live) == 1:
+        return values[live[0]], None
+    if not live:
+        return None, (
+            f"Cannot bind required kernel parameter(s): {name}. The model has "
+            f"several values for that name -- {candidates} -- and forward() "
+            f"references none of them, so the intended operand cannot be "
+            f"inferred. Name it explicitly as one of: {suggestions}."
+        )
+    return None, (
+        f"Cannot bind required kernel parameter(s): {name}. The name is "
+        f"ambiguous for this Model: {candidates}, and forward() uses more "
+        f"than one of them. Rename the parameter to the module-qualified "
+        f"underscore spelling of the intended value, e.g. {suggestions}."
     )
 
 
@@ -139,14 +301,19 @@ def bind_kernel_call(
     ``get_init_inputs()`` is intentionally absent: those values construct the
     model and are never guessed to be kernel arguments.
 
-    Parameters are resolved by name against model state (qualified or leaf
-    aliases), then positionally from ``inputs``. A ``w``/``gamma``/``beta``
+    Parameters are resolved by name against model state (full-path
+    underscore-qualified, qualified or leaf aliases), then positionally from
+    ``inputs``. A ``w``/``gamma``/``beta``
     alias whose leaf belongs to more than one module is rejected with a
     ``KernelCallBindingError`` rather than silently bound to the first match.
     """
     signature = inspect.signature(kernel_function)
     parameters = list(signature.parameters.values())
     model_values, ordered_parameters, owners = collect_model_values(model)
+    # Decoy-parameter guard evidence (KernelBench L2 #26): which top-level
+    # attributes the Model class actually uses. None = source unavailable,
+    # and the guard then keeps the legacy binding decision.
+    used_attrs = _model_used_attrs(model) if model is not None else None
     if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
         positional = [*inputs, *ordered_parameters]
         return lambda: kernel_function(*positional)
@@ -161,7 +328,14 @@ def bind_kernel_call(
         if conflict is not None:
             raise KernelCallBindingError(conflict)
         source_name = _ALIASES.get(parameter.name, parameter.name)
-        if source_name in model_values:
+        resolved, conflict = _resolve_bare_leaf(
+            source_name, model_values, owners, used_attrs
+        )
+        if conflict is not None:
+            raise KernelCallBindingError(conflict)
+        if resolved is not None:
+            value = resolved
+        elif source_name in model_values:
             value = model_values[source_name]
         elif (state_value := _resolve_state_alias(source_name, model_values)) is not None:
             value = state_value
@@ -618,6 +792,10 @@ def runtime_bindability_probe(
         # bind_kernel_call feeds every input and named parameter positionally
         # when the signature declares *args; it cannot run out of slots.
         return None
+    # Mirror the runtime decoy-parameter guard: the probe's Model is exec'd
+    # from a string (getsource unavailable), so read the same evidence from
+    # the problem text itself.
+    used_attrs = _source_used_attrs(problem_source)
     missing: list[str] = []
     input_index = 0
     for name in parameter_names:
@@ -627,6 +805,13 @@ def runtime_bindability_probe(
         if conflict is not None:
             return conflict
         source_name = _ALIASES.get(name, name)
+        resolved, conflict = _resolve_bare_leaf(
+            source_name, model_values, owners, used_attrs
+        )
+        if conflict is not None:
+            return conflict
+        if resolved is not None:
+            continue
         if source_name in model_values:
             continue
         try:
@@ -644,7 +829,16 @@ def runtime_bindability_probe(
         missing.append(name)
     if not missing:
         return None
-    available = ", ".join(sorted(model_values)) or "none"
+    def writable(key: str) -> str:
+        # Dotted keys are not valid Python identifiers; show the exact
+        # parameter name a signature must declare (L2 #15/#72: the repair
+        # prompt showed "batch_norm.running_mean" with no usable spelling).
+        if "." not in key:
+            return key
+        leaf = key.rsplit(".", 1)[-1]
+        return f"{key} (write as {key.replace('.', '_')} or {leaf})"
+
+    available = "; ".join(writable(key) for key in sorted(model_values)) or "none"
     detail = f" (static check said: {static_reason})" if static_reason else ""
     return (
         "runtime binding probe also cannot supply parameter(s): "
@@ -652,5 +846,100 @@ def runtime_bindability_probe(
         "Every consumer binds parameters by name from model state (named "
         "parameters/buffers, w/gamma/beta aliases, and module configuration) "
         "and positionally from the get_inputs() values; anything else must "
-        "have a default."
+        "have a default. Dots are not valid in Python identifiers: name a "
+        "module-qualified value by its underscore spelling (batch_norm."
+        "running_mean -> batch_norm_running_mean) or by its bare leaf name "
+        "when unique (running_mean); w/gamma/beta are rejected when two "
+        "modules own weight/bias."
     )
+
+
+# ---------------------------------------------------------------------------
+# Binding audit (refine-time diagnosis of numeric-mismatch failures)
+# ---------------------------------------------------------------------------
+
+class _AuditCaptured(Exception):
+    """Internal control flow: stop the spied call before the kernel body runs."""
+
+
+def binding_audit(
+    kernel_function: Callable[..., Any], model: Any | None, inputs: Sequence[Any]
+) -> str:
+    """Report which concrete value ``bind_kernel_call`` binds per parameter.
+
+    Numeric-mismatch failures do not name their cause: binding the wrong
+    tensor (KernelBench L2 #26: a bare ``bias`` bound an unused [64,1,1,1,1]
+    decoy parameter instead of ``conv_transpose.bias`` [64]) and a rewritten
+    activation formula (``x * hardswish(x)`` replaced by ``relu6(x)/6``)
+    both surface as the same aggregate "~95.5% mismatched" statistic the
+    refinement model cannot localize -- so it fixes one while introducing
+    the other, indefinitely. The audit binds a spy carrying the kernel's
+    real signature, records the exact object each parameter receives, and
+    names the model-state key it comes from, so the refinement prompt can
+    say ``bias == model state 'bias' [64,1,1,1,1] (also present:
+    conv_transpose.bias [64])`` or prove every input was bound correctly and
+    the defect is inside the kernel's arithmetic.
+
+    Never executes the kernel body: the spy raises before it runs, so the
+    audit works on CPU and does not require the built extension. Consistency
+    is by construction: the audit runs the real ``bind_kernel_call``.
+    """
+    import functools
+
+    signature = inspect.signature(kernel_function)
+    captured: dict[str, Any] = {}
+
+    @functools.wraps(kernel_function)
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        captured.update(bound.arguments)
+        raise _AuditCaptured
+
+    try:
+        bind_kernel_call(spy, model, inputs)()
+    except _AuditCaptured:
+        pass
+    except KernelCallBindingError as exc:
+        return f"binding audit: binding fails: {exc}"
+
+    state: list[tuple[str, Any]] = []
+    if model is not None:
+        state = list(model.named_parameters()) + list(model.named_buffers())
+
+    def describe(value: Any) -> str:
+        try:
+            import torch
+        except Exception:  # audit must never crash the round
+            return repr(value)[:100]
+        if not isinstance(value, torch.Tensor):
+            return f"{type(value).__name__}={value!r}"[:100]
+        detail = f"shape {list(value.shape)}, dtype {value.dtype}"
+        flat = value.detach().reshape(-1)
+        if flat.numel():
+            samples = ", ".join(f"{element:.6g}" for element in flat[:4].tolist())
+            detail += f", first values [{samples}]"
+        return detail
+
+    lines = ["binding audit (what bind_kernel_call actually delivered):"]
+    for name, value in captured.items():
+        origin = next((key for key, item in state if item is value), None)
+        if origin is None:
+            lines.append(f"- {name} <- positional input ({describe(value)})")
+            continue
+        lines.append(f"- {name} <- model state '{origin}' ({describe(value)})")
+        if "." in origin:
+            # A module-qualified origin names its module; no hijack risk left.
+            continue
+        siblings = [
+            key for key, _ in state
+            if key != origin and key.rsplit(".", 1)[-1] == origin.rsplit(".", 1)[-1]
+        ]
+        if siblings:
+            spelled = ", ".join(key.replace(".", "_") for key in siblings)
+            lines.append(
+                f"  note: the model also has {', '.join(siblings)} for the same"
+                f" leaf name; if '{origin}' is not what forward() uses, rename"
+                f" the parameter to the underscore spelling ({spelled})"
+            )
+    return "\n".join(lines)

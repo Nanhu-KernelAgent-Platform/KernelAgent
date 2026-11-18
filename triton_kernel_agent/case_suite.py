@@ -700,9 +700,21 @@ def suite_test(source, direction="forward", device="cuda"):
         isinstance(node, ast.FunctionDef) and node.name == "get_test_cases" for node in tree.body
     ):
         return None
-    return (SUITE_MARKER + "\nimport json, types\nfrom kernel_case_suite import verify_cases, RESULT_PREFIX\n"
-            "from kernel import kernel_function\nproblem = types.ModuleType('case_reference')\n"
-            f"exec(compile({source!r}, '<case_reference>', 'exec'), problem.__dict__)\n"
+    return (SUITE_MARKER + "\nimport json, sys, types\nfrom kernel_case_suite import verify_cases, RESULT_PREFIX\n"
+            "from kernel import kernel_function\n"
+            f"_source = {source!r}\n"
+            # Materialize the reference source as a real file and register the
+            # module in sys.modules so inspect.getsource works on the exec'd
+            # Model: the decoy-parameter guard (fix 1, L2 #26) reads usage
+            # evidence through getsource, and a '<case_reference>' pseudo-
+            # filename with no sys.modules entry makes it fail, which would
+            # silently degrade the guard to legacy binding inside the
+            # authoritative correctness gate.
+            "open('case_reference.py', 'w', encoding='utf-8').write(_source)\n"
+            "problem = types.ModuleType('case_reference')\n"
+            "problem.__file__ = 'case_reference.py'\n"
+            "sys.modules['case_reference'] = problem\n"
+            "exec(compile(_source, 'case_reference.py', 'exec'), problem.__dict__)\n"
             f"results = verify_cases(problem, kernel_function, {device!r}, {direction!r})\n"
             "print(RESULT_PREFIX + json.dumps(results, allow_nan=False))\n"
             "assert results and all(row['status'] == 'passed' for row in results), results\n")
