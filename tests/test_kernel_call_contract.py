@@ -4,8 +4,8 @@ docs/design_kernelagent_fix_3-1_signature_contract_binding.md — the main test
 is generated BEFORE the kernel exists, so it must invoke kernel_function
 through bind_kernel_call (exactly like the deterministic case suite and the
 KernelBench evaluator already do) instead of hardcoding a call signature.
-P50/P56 burned full verification runs on hardcoded-signature TypeErrors while
-the case suite passed.
+A hardcoded signature burns full verification runs on TypeErrors while the
+case suite passes.
 """
 
 from unittest.mock import Mock
@@ -187,8 +187,8 @@ def test_binding_validator_is_musa_scoped():
 
 def test_third_attempt_recovers_before_kernel_generation():
     # Fix 4-1 A3: three attempts; the third fires only where the previous
-    # behavior hard-failed the whole problem (P47 wasted attempt 1 on a
-    # no-code response and attempt 2 on a validation false positive).
+    # behavior hard-failed the whole run (a wasted attempt on a no-code
+    # response and another on a validation false positive).
     agent = make_agent(get_platform("musa"))
     agent._call_llm = Mock(side_effect=[DIRECT_CALL_TEST, DIRECT_CALL_TEST, BIND_PATTERN_TEST])
     assert agent._generate_test("formula") == BIND_PATTERN_TEST
@@ -221,7 +221,7 @@ def test_retry_log_reports_the_real_attempt_budget():
 
 def test_repair_message_carries_the_legal_leaf_pattern():
     # Fix 4-1 A2: the repair prompt must teach the concrete move() pattern
-    # instead of the misleading torch.randn-only advice (P45/P47 evidence).
+    # instead of the misleading torch.randn-only advice.
     agent = make_agent(get_platform("musa"))
     agent._call_llm = Mock(side_effect=[DIRECT_CALL_TEST, BIND_PATTERN_TEST])
     agent._generate_test("formula")

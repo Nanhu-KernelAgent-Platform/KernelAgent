@@ -26,7 +26,7 @@ INT32_LIMIT = 2 ** 31 - 1
 # override it inherits torch's dtype defaults (fp32: rtol=1.3e-6, atol=1e-5),
 # which a long fp32 reduction cannot meet even when it is numerically correct: a
 # summation order that differs from the eager reference alone costs ~12-14 ULP
-# (KernelBench L1 #4, a 1M-element fp32 dot product, lands at 1.4-1.7e-6).
+# (a 1M-element fp32 dot product lands at 1.4-1.7e-6).
 # KernelBench scores correctness at atol=rtol=1e-2
 # (KernelBench/src/kernelbench/eval.py), so the bridge supplies that standard for
 # KernelBench sources only and restores the previous values afterwards.
@@ -162,8 +162,8 @@ def install_tolerance_pin():
         torch.testing.assert_allclose = _pinned_call(assert_close, deprecated, overrides)
     # Generated tests also express the comparison as a boolean
     # ``torch.allclose(...)`` guard, which never enters torch.testing and so
-    # bypassed the pin: KernelBench L2 #62 (run at 12:40) still failed at
-    # rtol=atol=1e-3 on a 4.8e-3 max diff that the benchmark standard accepts.
+    # bypassed the pin: a case could still fail at rtol=atol=1e-3 on a
+    # 4.8e-3 max diff that the benchmark standard accepts.
     allclose = getattr(torch, "allclose", None)
     if allclose is not None:
         _PIN_ORIGINALS["allclose"] = allclose
@@ -533,8 +533,8 @@ def verify_cases(problem, kernel, device, direction="forward"):
                     expected = concat_outputs([model(*slice_inputs(inputs, sl)) for sl in slices])
             # Reference sanity: an all-zero reference with non-zero inputs has two
             # very different meanings.
-            #   (a) The graph is degenerate by construction: KernelBench L2 #80
-            #       reduces a (1024, 8192) GEMM over dim=1 to (1024, 1) and then
+            #   (a) The graph is degenerate by construction: a model reduces
+            #       a (1024, 8192) GEMM over dim=1 to (1024, 1) and then
             #       subtracts that row's own mean, which is exactly 0.0 in IEEE-754
             #       for every row -- the true output IS all zero. It must be
             #       compared like any other case: only status "passed" can satisfy
@@ -705,7 +705,7 @@ def suite_test(source, direction="forward", device="cuda"):
             f"_source = {source!r}\n"
             # Materialize the reference source as a real file and register the
             # module in sys.modules so inspect.getsource works on the exec'd
-            # Model: the decoy-parameter guard (fix 1, L2 #26) reads usage
+            # Model: the decoy-parameter guard reads usage
             # evidence through getsource, and a '<case_reference>' pseudo-
             # filename with no sys.modules entry makes it fail, which would
             # silently degrade the guard to legacy binding inside the

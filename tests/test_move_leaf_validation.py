@@ -15,7 +15,7 @@ import pytest
 from triton_kernel_agent.test_validation import validate_test_autograd
 
 
-# P45 attempt 1 / P47 form: move(..., gradients=True) result.
+# move(..., gradients=True) result.
 MOVE_CALL_TEST = '''
 import torch
 from kernel_case_suite import move
@@ -28,7 +28,7 @@ def main():
     out.backward()
 '''
 
-# P45 attempt 2 form: two-step container element access.
+# Two-step container element access.
 MOVE_TWO_STEP_TEST = '''
 import torch
 from kernel_case_suite import move
@@ -163,12 +163,12 @@ def main():
 
 
 def test_move_call_result_is_a_leaf():
-    # P45 attempt 1 / P47: rejected twice by the old rule, legal at runtime.
+    # Rejected twice by the old rule, legal at runtime.
     validate_test_autograd(MOVE_CALL_TEST)
 
 
 def test_move_two_step_element_is_a_leaf():
-    # P45 attempt 2: inputs_ref = move(...); x_ref = inputs_ref[0].
+    # inputs_ref = move(...); x_ref = inputs_ref[0].
     validate_test_autograd(MOVE_TWO_STEP_TEST)
 
 

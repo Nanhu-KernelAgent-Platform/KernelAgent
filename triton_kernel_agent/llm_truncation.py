@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Output-cap truncation detection and continuation (fix 6-1).
+"""Output-cap truncation detection and continuation.
 
 Shared by the worker refinement loop and the agent seed-generation path so
 both react to a response cut off at the model's output-token cap the same way:
@@ -66,8 +66,8 @@ def looks_truncated(
     Signal A (finish_reason == 'length'): universal, zero-config on
     well-behaved servers, fires at any cap size.
     Signal B (completion_tokens >= threshold): fallback for servers that
-    report 'stop' at the cap (MusaCoder evidence: all 10 truncated refinement
-    responses in the P45-56 batch did exactly that).
+    report 'stop' at the cap (observed on MusaCoder: every truncated
+    refinement response reported 'stop').
     """
     if malformed_reason is None:
         return False  # only malformed responses are continuation candidates

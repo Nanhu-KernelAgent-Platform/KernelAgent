@@ -81,8 +81,7 @@ def _resolve_state_alias(name: str, values: dict[str, Any]) -> Any | None:
        The historical last-underscore split cannot express multi-word
        leaves (``running_mean``), which made every module-qualified
        spelling of an implicit BatchNorm buffer unbindable while the
-       repair guidance kept recommending exactly that spelling
-       (KernelBench L2 #15/#72: all repair rounds rejected).
+       repair guidance kept recommending exactly that spelling.
     2. Legacy fallback, unchanged: single-word ``weight``/``bias``
        leaves split at the last underscore, then the numbered-module
        form (``fc_weight`` -> ``fc1.weight``).
@@ -136,7 +135,7 @@ def _alias_conflict(
     A fused model (Linear + GroupNorm, Conv + BatchNorm) exposes ``.weight``
     twice, so the alias cannot name a module -- the failure mode that bound the
     Linear's [out, in] weight as GroupNorm ``gamma`` and silently produced a
-    near-zero output (KernelBench L2 #30). Reject instead of picking the first
+    near-zero output. Reject instead of picking the first
     match, and name the module-qualified parameters the kernel should use.
     """
     if name not in _ALIASES:
@@ -229,20 +228,18 @@ def _resolve_bare_leaf(
     leaf alias (``bias``). A top-level parameter whose full path IS the leaf
     name overwrites that alias, so ``kernel_function(..., bias, ...)`` bound
     the decoy ``self.bias`` [64,1,1,1,1] instead of ``conv_transpose.bias``
-    [64] (KernelBench L2 #26: the decoy never appears in forward(); every
-    round failed with 95.6% mismatch and max|diff| ~10.4, an error signature
-    no aggregate statistic could localize).
+    [64]; the decoy never appears in forward(), and the resulting aggregate
+    mismatch statistics carry no hint of the wrong binding.
 
     Only the dangerous overlap changes behaviour -- a bare leaf owned by
     several submodules keeps its documented first-module-wins contract:
 
     1. The exact full-path owner referenced by the class (``self.bias``)
-       wins: the parameter names that state exactly (L2 #75 declares
-       ``bias`` beside ``gemm``/``groupnorm`` and must keep binding the
-       top-level parameter its forward adds).
+       wins: a signature that declares ``bias`` beside ``gemm``/``groupnorm``
+       must keep binding the top-level parameter its forward adds.
     2. Otherwise the exact owner is dead state; keep only owners whose
        top-level module the class references. Exactly one survivor resolves
-       to it (#26 -> ``conv_transpose.bias``).
+       to it (the ``conv_transpose.bias`` case above).
     3. Zero or several survivors reject with the module-qualified
        spellings; missing evidence (``used_attrs is None``) keeps the legacy
        binding -- never regress a working kernel when disambiguation
@@ -310,8 +307,8 @@ def bind_kernel_call(
     signature = inspect.signature(kernel_function)
     parameters = list(signature.parameters.values())
     model_values, ordered_parameters, owners = collect_model_values(model)
-    # Decoy-parameter guard evidence (KernelBench L2 #26): which top-level
-    # attributes the Model class actually uses. None = source unavailable,
+    # Decoy-parameter guard evidence: which top-level attributes the Model
+    # class actually uses. None = source unavailable,
     # and the guard then keeps the legacy binding decision.
     used_attrs = _model_used_attrs(model) if model is not None else None
     if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
@@ -673,8 +670,8 @@ def kernel_signature_bindability(kernel_source: str, problem_source: str) -> str
 # ``register_buffer`` calls executed inside custom modules, ...). Rejecting
 # such a signature at seed-extraction time kills every repair round: the
 # runtime ``bind_kernel_call`` can fill the parameter, but the static gate
-# refuses the seed (P77, 2026-11-14: ``running_mean`` / ``running_var`` are
-# named buffers, so a correct BatchNorm3d-inference kernel could never pass).
+# refuses the seed (``running_mean`` / ``running_var`` are named buffers, so
+# a correct BatchNorm3d-inference kernel could never pass).
 # The probe below replays *exactly* the fill decision of ``bind_kernel_call``
 # against a meta-device ``Model`` instance and is called only after the static
 # check already rejected the seed. It also replays the alias-ambiguity
@@ -831,8 +828,9 @@ def runtime_bindability_probe(
         return None
     def writable(key: str) -> str:
         # Dotted keys are not valid Python identifiers; show the exact
-        # parameter name a signature must declare (L2 #15/#72: the repair
-        # prompt showed "batch_norm.running_mean" with no usable spelling).
+        # parameter name a signature must declare, because a bare dotted
+        # key like "batch_norm.running_mean" is not a spelling the repair
+        # prompt can copy.
         if "." not in key:
             return key
         leaf = key.rsplit(".", 1)[-1]
@@ -868,11 +866,11 @@ def binding_audit(
     """Report which concrete value ``bind_kernel_call`` binds per parameter.
 
     Numeric-mismatch failures do not name their cause: binding the wrong
-    tensor (KernelBench L2 #26: a bare ``bias`` bound an unused [64,1,1,1,1]
-    decoy parameter instead of ``conv_transpose.bias`` [64]) and a rewritten
-    activation formula (``x * hardswish(x)`` replaced by ``relu6(x)/6``)
-    both surface as the same aggregate "~95.5% mismatched" statistic the
-    refinement model cannot localize -- so it fixes one while introducing
+    tensor (a bare ``bias`` bound to an unused [64,1,1,1,1] decoy parameter
+    instead of ``conv_transpose.bias`` [64]) and a rewritten activation
+    formula (``x * hardswish(x)`` replaced by ``relu6(x)/6``) both surface
+    as the same aggregate mismatch statistic the refinement model cannot
+    localize -- so it fixes one while introducing
     the other, indefinitely. The audit binds a spy carrying the kernel's
     real signature, records the exact object each parameter receives, and
     names the model-state key it comes from, so the refinement prompt can

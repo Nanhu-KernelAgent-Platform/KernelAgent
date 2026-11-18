@@ -886,7 +886,7 @@ def kernel_function(*args, **kwargs):
                 # buffers that module constructors create implicitly
                 # (BatchNorm*d running statistics, register_buffer inside
                 # custom modules, ...), which made correct signatures
-                # unpassable (P77, 2026-11-14). A statically rejected seed is
+                # unpassable. A statically rejected seed is
                 # therefore arbitrated by a probe that replays the real
                 # bind_kernel_call fill decision (including the ambiguous
                 # w/gamma/beta alias rejection) on a meta-device Model; only a

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Verification-direction policy (fix 7-1: KernelBench forward-only mode).
+"""Verification-direction policy (forward-only mode).
 
 KernelBench's official metric scores the forward output only. The generated
 correctness test used to demand a correct backward as well (dgrad/wgrad/bias

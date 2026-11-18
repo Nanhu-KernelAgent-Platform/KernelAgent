@@ -142,7 +142,7 @@ class TwoModuleModel(FakeModel):
 
 
 def test_ambiguous_alias_is_rejected_instead_of_binding_first_match():
-    """L2 #30: ``gamma`` must not silently bind the Linear weight (8192x8192)."""
+    """``gamma`` must not silently bind the Linear weight (8192x8192)."""
 
     def kernel_function(x, weight, bias, gamma, beta):
         return x, weight, bias, gamma, beta
@@ -287,11 +287,11 @@ def test_runtime_probe_overrules_static_false_negative():
 
 
 # ---------------------------------------------------------------------------
-# Full-path underscore resolution for multi-word leaves (L2 #15/#72)
+# Full-path underscore resolution for multi-word leaves
 # ---------------------------------------------------------------------------
 
 class ConvTransposeBNModel(FakeModel):
-    """The L2 #15/#72 reference shape: two weight owners + implicit BN buffers."""
+    """Reference shape with two weight owners and implicit BN buffers."""
 
     def __init__(self):
         self.conv_w, self.conv_b = object(), object()
@@ -315,7 +315,7 @@ class ConvTransposeBNModel(FakeModel):
 
 
 def test_module_qualified_buffer_names_bind_after_full_path_match():
-    """L2 #72 repair-3 signature verbatim: rejected before the fix, must bind now."""
+    """A fully module-qualified buffer signature must bind."""
     model = ConvTransposeBNModel()
     x = object()
 
@@ -331,7 +331,7 @@ def test_module_qualified_buffer_names_bind_after_full_path_match():
 
 
 def test_bare_buffer_leaf_names_still_bind():
-    """P77 regression guard: bare running_mean/running_var keep binding."""
+    """Regression guard: bare running_mean/running_var keep binding."""
     model = ConvTransposeBNModel()
     x = object()
 
@@ -353,7 +353,7 @@ def test_abbreviated_module_prefix_still_rejected():
 
 
 def test_ambiguous_gamma_still_rejected_and_message_teaches_buffers():
-    """L2 #30 safety invariant + Part B guidance in the alias-conflict message."""
+    """Ambiguous ``gamma`` stays rejected and the message teaches buffer spellings."""
     def kernel_function(x, gamma):
         return x, gamma
 

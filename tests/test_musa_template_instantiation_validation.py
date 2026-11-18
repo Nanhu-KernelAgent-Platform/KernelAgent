@@ -1,11 +1,11 @@
 """Static check: explicit template instantiations must repeat their template.
 
-Problem 62 (2026-10-25) generated ``template <typename scalar_t> void
+A generated bundle declared ``template <typename scalar_t> void
 launch_conv2d_forward(...)`` with 19 parameters but
 ``template void launch_conv2d_forward<float>(...)`` with 18 arguments. mcc could
 only say "does not refer to a function template" plus a "could not match ...
-against ..." note, so the refinement loop repeated the same off-by-one: two
-29-minute refinements were lost.
+against ..." note, so the refinement loop repeated the same off-by-one and
+lost two full refinement rounds.
 
 ``validate_template_instantiations`` reports the exact counts instead. It is
 fail-open: any arity it cannot pin down is never reported.
@@ -22,7 +22,7 @@ from triton_kernel_agent.kernel_backend import (
 from triton_kernel_agent.worker import VerificationWorker
 
 
-# --- problem 62 evidence --------------------------------------------------
+# --- real bundle evidence -------------------------------------------------
 
 # Real round_2 kernel.mu (declaration at line 48, instantiations at 216-221).
 P62_ROUND_2 = '''

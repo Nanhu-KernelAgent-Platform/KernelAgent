@@ -166,8 +166,7 @@ def validate_test_autograd(source: str) -> None:
     # at runtime, not only torch factories and move():
     #   * ``for p in model.parameters()/buffers()`` (and the ``named_*`` tuple
     #     forms) yields ``nn.Parameter``/registered buffer objects, which are
-    #     leaves -- setting ``p.requires_grad = True`` on them is legal. Observed
-    #     live on 2026-10-25 (agent_20261025_093522.log): a legal
+    #     leaves -- setting ``p.requires_grad = True`` on them is legal. a legal
     #     ``for param in ref_model.parameters(): param.requires_grad = True`` was
     #     rejected and cost a full regeneration.
     #   * ``t.detach()`` returns a new tensor with no graph, so the result is a
@@ -225,7 +224,7 @@ def validate_test_autograd(source: str) -> None:
         Covers the direct call, subscript chains over the call (move maps
         containers recursively), and subscripting a name previously bound to
         a move() result (``inputs = move(...); x = inputs[0]``) -- the
-        P45 attempt-2 form. The chain stops at anything that is not a
+        two-step form. The chain stops at anything that is not a
         subscript or the move call itself: ``move(...)[0].clone()`` is a
         derived tensor and stays rejected.
         """
@@ -406,8 +405,8 @@ def validate_test_kernel_call_binding(source: str) -> None:
     through ``bind_kernel_call`` (by name against the reference model's state,
     then positionally from ``get_inputs()``). A hardcoded ``kernel_function(...)``
     call in the main test is a guess about a signature that has not been
-    generated yet; P50/P56 burned full verification runs on exactly that
-    mismatch. Reject the direct call statically and require at least one
+    generated yet; a mismatch like that burns full verification runs.
+    Reject the direct call statically and require at least one
     ``bind_kernel_call`` call site instead.
     """
     tree = ast.parse(source)

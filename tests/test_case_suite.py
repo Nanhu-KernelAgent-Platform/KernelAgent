@@ -381,7 +381,7 @@ def test_multi_output_all_zero_reference_is_compared_not_skipped():
 
 
 # --- A degenerate graph is not an unsupported reference -----------------------
-# KernelBench L2 #80: max over dim=1 collapses (1024, 8192) to (1024, 1) and the
+# A max over dim=1 collapses (1024, 8192) to (1024, 1) and the
 # next step subtracts that row's own mean, which is exactly 0.0 for every row.
 # The all-zero reference is the TRUE output, but the reference-sanity probe used
 # to label it "reference-unsupported", and no status other than "passed" can

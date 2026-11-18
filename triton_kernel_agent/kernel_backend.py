@@ -343,7 +343,7 @@ def validate_musa_bundle_semantics(bundle: KernelBundle) -> str | None:
                 )
 
     # 5. Dispatch dtype set must equal the instantiated dtype set.
-    # Observed on conv_transpose1d (P74): binding.cpp used
+    # Observed on conv_transpose1d: binding.cpp used
     # AT_DISPATCH_FLOATING_TYPES (float AND double) while kernel.mu only
     # instantiated <float>, so the module failed at import with
     # "undefined symbol: launch_conv_transpose1d<double>". A "keep the output
@@ -369,7 +369,7 @@ def validate_musa_bundle_semantics(bundle: KernelBundle) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Explicit template instantiation arity (problem 62 class)
+# Explicit template instantiation arity
 # ---------------------------------------------------------------------------
 
 _TEMPLATE_DECL_RE = re.compile(
@@ -463,9 +463,9 @@ def validate_template_instantiations(
     ``template void f<T>(...)`` must repeat every template parameter. On a
     mismatch mcc only reports "does not refer to a function template" plus a
     "could not match ... against ..." note that the model cannot count from, so
-    the refinement loop repeats the same off-by-one (problem 62, 2026-10-25:
-    two wasted 29-minute refinements). Reporting the exact counts instead keeps
-    the repair actionable.
+    the refinement loop repeats the same off-by-one and burns full
+    refinement rounds. Reporting the exact counts instead keeps the repair
+    actionable.
 
     Fail-open by construction: an arity that cannot be pinned down (parameter
     pack, defaulted parameter, conditional compilation, conflicting

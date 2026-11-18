@@ -169,7 +169,7 @@ def test_bundle_writes_are_safe_under_workdir(tmp_path: Path):
 
 
 def test_musa_extension_entry_named_after_a_torch_method_is_not_a_fallback(tmp_path):
-    """KernelBench L1 #4: ``ext.matmul(A, B)`` must not be read as ``Tensor.matmul``."""
+    """``ext.matmul(A, B)`` must not be read as ``Tensor.matmul``."""
     (tmp_path / "work").mkdir()
     (tmp_path / "logs").mkdir()
     worker = VerificationWorker(

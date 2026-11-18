@@ -135,10 +135,10 @@ DISALLOWED_TORCH_PATTERNS = [
 # Native MUSA wrappers must call the compiled extension entry point, and the
 # generated entry name is the model's choice, so a name that collides with a
 # torch method (``matmul``/``mm``/``bmm``/``forward``) is a legitimate extension
-# call, not a PyTorch fallback. KernelBench L1 #4 hit exactly that: MusaCoder
-# named the pybind entry ``matmul`` and ``matvec_kernel.matmul(A, B)`` was caught
-# by the receiver-agnostic ``.(matmul|mm|bmm)(`` rule, which then deadlocked the
-# refine loop because the error text never reveals that the name is the problem.
+# call, not a PyTorch fallback. A pybind entry named ``matmul`` makes
+# ``matvec_kernel.matmul(A, B)`` match the receiver-agnostic
+# ``.(matmul|mm|bmm)(`` rule, which deadlocks the refine loop because the
+# error text never reveals that the name is the problem.
 # The torch-prefixed bans above still reject ``torch.matmul``/``torch.mm``/
 # ``torch.bmm``/``torch.einsum`` and every torch.nn/.functional path, so this
 # exemption stops the method-call heuristic from misfiring on extension entry
@@ -251,14 +251,14 @@ _FORMAT_NUDGE = (
     "Preserve the public contract and do not weaken any test."
 )
 
-# Refine-time binding audit probe (fix 2, KernelBench L2 #26). Runs fully on
-# CPU inside the workdir: extracts kernel_function's signature from kernel.py
-# by AST (the def is exec'd but its body is never executed, so the audit works
-# even when the extension did not build), builds the reference Model from the
-# problem description the same way the case suite does (real source file +
-# sys.modules registration, so getsource -- and therefore the decoy guard of
-# fix 1 -- sees the same usage evidence as the authoritative gate), and prints
-# what bind_kernel_call delivers per parameter.
+# Refine-time binding audit probe. Runs fully on CPU inside the workdir:
+# extracts kernel_function's signature from kernel.py by AST (the def is
+# exec'd but its body is never executed, so the audit works even when the
+# extension did not build), builds the reference Model from the problem
+# description the same way the case suite does (real source file +
+# sys.modules registration, so getsource -- and therefore the
+# decoy-parameter guard -- sees the same usage evidence as the authoritative
+# gate), and prints what bind_kernel_call delivers per parameter.
 BINDING_AUDIT_PROBE = r'''
 import ast, re, sys, types
 import torch
@@ -268,8 +268,9 @@ problem_description = sys.stdin.read()
 headings = list(re.finditer(r"(?m)^## Describe2[^\n]*\n", problem_description))
 source = problem_description[headings[-1].end():] if headings else problem_description
 # Mirror the case-suite companion: a real file plus a sys.modules entry makes
-# inspect.getsource work on the exec'd Model, so the decoy guard (fix 1) and
-# the audit agree with the binding the verification gate actually performed.
+# inspect.getsource work on the exec'd Model, so the decoy-parameter guard
+# and the audit agree with the binding the verification gate actually
+# performed.
 open("case_reference.py", "w", encoding="utf-8").write(source)
 problem = types.ModuleType("case_reference")
 problem.__file__ = "case_reference.py"
@@ -782,8 +783,8 @@ class VerificationWorker:
         Both feed the truncation detector (fix 6-1): ``finish_reason ==
         'length'`` is the universal cap-hit signal on well-behaved servers,
         while the token threshold covers servers that report ``'stop'`` at
-        the cap (all 10 truncated MusaCoder refinement responses in the
-        P45-56 batch did exactly that).
+        the cap (observed on MusaCoder: every truncated refinement response
+        reported ``'stop'``).
         """
         if not self.provider:
             raise RuntimeError(f"No provider available for model {self.openai_model}")
@@ -1116,12 +1117,12 @@ class VerificationWorker:
                     "stderr": _clip_error_text(stderr),
                     "history": list(self.history),
                 }
-                # Fix 2 (binding audit): numeric mismatches carry no cause --
-                # a decoy-parameter binding (L2 #26 trap A) and a rewritten
-                # activation formula (trap B) produce the same aggregate
-                # statistics, so the refinement model alternated between them
-                # for five rounds. Name the tensor every parameter actually
-                # received, and the two failure classes separate.
+                # Binding audit: numeric mismatches carry no cause -- a
+                # wrongly bound parameter and a rewritten activation formula
+                # produce the same aggregate statistics, so the refinement
+                # model can keep fixing one while introducing the other.
+                # Name the tensor every parameter actually received, and the
+                # two failure classes separate.
                 if self._binding_audit_wanted(
                     stdout, stderr, getattr(self, "last_case_results", [])
                 ):

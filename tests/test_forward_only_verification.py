@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fix 7-1: forward-only verification for KernelBench-style scoring.
+"""Forward-only verification for KernelBench-style scoring.
 
 KernelBench scores the forward output only. These tests pin that the generated
 correctness test stops demanding a correct backward (the "Weight gradient

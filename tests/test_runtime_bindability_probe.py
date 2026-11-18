@@ -3,9 +3,9 @@
 Context: ``kernel_signature_bindability`` builds its bindable-name set from
 Model source only, so it under-approximates the runtime state for buffers a
 module constructor creates implicitly (``BatchNorm*d`` running statistics,
-``register_buffer`` inside custom modules, ...). On 2026-11-14 that made a
-correct BatchNorm3d-inference kernel for KernelBench L2 problem 77
-unpassable: every repair round declared ``running_mean``/``running_var`` in
+``register_buffer`` inside custom modules, ...). That under-approximation
+made a correct BatchNorm3d-inference kernel unpassable: every repair round
+declared ``running_mean``/``running_var`` in
 some form and the static gate rejected all of them at seed time, before any
 verification could run.
 
@@ -15,10 +15,10 @@ pin the probe to the real binder (golden parity) across signature styles and
 problem shapes instead of pinning it to one problem's spelling, so any future
 divergence between the two binding paths fails a test.
 
-The 2026-11-17 L2 #15/#72 fix extends ``_resolve_state_alias`` with a
-full-path underscore match, so module-qualified multi-word leaves
-(``batch_norm_running_mean`` -> ``batch_norm.running_mean``) bind exactly
-like ``batch_norm_weight`` always did; the parity table below pins that
+``_resolve_state_alias`` also performs a full-path underscore match, so
+module-qualified multi-word leaves (``batch_norm_running_mean`` ->
+``batch_norm.running_mean``) bind exactly like ``batch_norm_weight``
+always did; the parity table below pins that
 behaviour as well.
 """
 import pytest
@@ -182,7 +182,7 @@ def _probe_accepts(problem_source: str, kernel_source: str):
 
 CASES = [
     # (label, problem, kernel parameters, expected accept)
-    # -- problem 77 regression: signatures that the static gate killed ------
+    # -- signatures the static gate historically killed ---------------------
     # Qualified names plus the ``gamma``/``beta`` aliases: BN3D_PROBLEM has
     # three modules owning the leaf ``weight``, so the alias is ambiguous and
     # the binder refuses it (the probe replays the same rejection). See
@@ -213,8 +213,8 @@ CASES = [
         "x, conv_weight, conv_bias, bn_weight, bn_bias, bn_running_mean, bn_running_var",
         False,
     ),
-    # -- L2 #15/#72 fix: full-path underscore resolution makes the
-    #    module-qualified buffer spelling bindable (probe == binder == True).
+    # -- Full-path underscore resolution makes the module-qualified buffer
+    #    spelling bindable (probe == binder == True).
     (
         "bn3d_module_prefixed_running_stats",
         BN3D_PROBLEM,
@@ -268,7 +268,7 @@ P77_KERNEL = _kernel(
 
 
 def test_p77_static_gate_rejected_valid_signature_but_probe_accepts():
-    """The exact signature style that died at seed time on 2026-11-14."""
+    """The exact signature style the static gate used to kill at seed time."""
     static_reason = kernel_signature_bindability(P77_KERNEL, BN3D_PROBLEM)
     assert static_reason is not None, "static gate must keep its old behavior..."
     assert "running_mean" in static_reason
@@ -280,7 +280,7 @@ def test_p77_static_gate_rejected_valid_signature_but_probe_accepts():
 
 
 def test_probe_accepts_module_qualified_running_stats():
-    """L2 #15/#72: the historically fatal module-qualified spelling now binds."""
+    """The module-qualified multi-word spelling now binds."""
     kernel_source = _kernel(
         "x, batch_norm_weight, batch_norm_bias, "
         "batch_norm_running_mean, batch_norm_running_var"
@@ -300,7 +300,7 @@ def test_probe_rejection_names_missing_parameters_and_available_state():
     assert "bogus_stat" in reason
     # The available-state list must be signature-ready: dotted keys come with
     # their usable parameter spellings so the repair round can converge in
-    # one attempt (L2 #15/#72: bare dotted names were uncopyable).
+    # one attempt (a bare dotted name is not a copyable identifier).
     assert "batch_norm.running_mean" in reason
     assert "write as batch_norm_running_mean" in reason
     assert "write as batch_norm_running_var" in reason
